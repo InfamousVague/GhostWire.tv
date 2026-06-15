@@ -45,10 +45,10 @@ concurrency:
 
 jobs:
   # Windows + Linux on their native runners. tauri-action creates the release
-  # (on tag) and uploads the bundles to it. Linux ships .deb + .rpm only —
-  # the .AppImage target fails opaquely on GitHub runners (linuxdeploy / FUSE),
-  # a lesson learned the hard way on Libre; .deb/.rpm cover the vast majority of
-  # installs and the site's Linux button resolves any of .appimage/.deb/.rpm.
+  # (on tag) and uploads the bundles to it. Linux ships .AppImage + .deb + .rpm
+  # (ghosty's AppImage builds cleanly on the runners — the APPIMAGE_EXTRACT_AND_RUN
+  # / NO_STRIP env below are the standard FUSE-less CI workaround). AppImage is
+  # the portable, install-free download; .deb/.rpm cover package-manager installs.
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
@@ -59,7 +59,7 @@ jobs:
         include:
           - os: ubuntu-22.04
             label: Linux (x64)
-            args: "--bundles deb,rpm"
+            args: "--bundles appimage,deb,rpm"
           - os: windows-latest
             label: Windows (x64)
             args: ""
@@ -116,6 +116,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # AppImage tooling (linuxdeploy) is itself an AppImage; ubuntu runners
+          # lack libfuse2, so extract-and-run instead of FUSE-mounting. NO_STRIP
+          # avoids a linuxdeploy strip failure. Both are no-ops on Windows.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          NO_STRIP: true
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('The Black Pearl {0}', github.ref_name) || '' }}
