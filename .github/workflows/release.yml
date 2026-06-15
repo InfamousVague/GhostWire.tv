@@ -1,22 +1,35 @@
 name: Release
 
-# Build the Windows + Linux desktop bundles on tag push and attach them to the
-# GitHub Release — which is what the download buttons on mattssoftware.com
-# resolve. macOS is built + notarized locally with `make` (same split as Libre:
-# Mac signing is easiest with the Developer ID cert in the local keychain), so
-# CI covers only the platforms that can't be built on the Mac.
+# Build every desktop bundle on a version tag and attach it to the GitHub
+# Release that mattssoftware.com's download buttons resolve. macOS is now
+# built, Developer-ID-signed, and Apple-notarized ENTIRELY IN CI (the `macos`
+# job) — modeled on the proven Blip release workflow + ghosty's own `make`
+# flow — so cutting a release no longer needs `make` on the maintainer's Mac.
+# Windows + Linux build via tauri-action on their native runners.
 #
 # The @mattmattmattmatt/base "file:../../Libs/base" dependency is materialized
-# from the sibling InfamousVague/base repo before `npm ci`, mirroring Libre.
+# from the sibling InfamousVague/base repo before `npm ci` (same dance Libre +
+# Blip use), so the relative path package.json expects resolves on every runner.
 #
-# Trigger: push a tag like v0.1.0  →  builds Windows + Linux, uploads to the
-#          release named after the tag (the macOS .dmg from `make` already
-#          lives there).  workflow_dispatch → ad-hoc build (artifacts on the run).
+# Trigger:
+#   - push a tag like v0.1.0  →  builds macOS + Windows + Linux and uploads
+#                                them to the release named after the tag.
+#   - workflow_dispatch       →  smoke-builds Windows + Linux (artifacts on the
+#                                run). The macOS job is tag-only (it needs the
+#                                release to upload the signed DMG to).
 #
-# To also build macOS in CI: add a `macos-latest` matrix entry with
-# `args: --target universal-apple-darwin`, set the APPLE_* repo secrets
-# (certificate base64, identity, Apple ID, app password, team id), and pass
-# them to tauri-action's env — but the local `make` flow is the supported path.
+# Required repo secrets for the signed macOS build — set these on
+# InfamousVague/TheBlackPearl (mirror the Blip repo's values). ghosty has NO
+# OTA updater, so the TAURI_SIGNING_* keys Blip/Libre use are NOT needed here:
+#   APPLE_CERTIFICATE            base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD   the .p12 export password
+#   APPLE_SIGNING_IDENTITY       "Developer ID Application: Matt Wisniewski (F6ZAL7ANAD)"
+#   APPLE_ID                     Apple ID email
+#   APPLE_PASSWORD               app-specific password for that Apple ID
+#   APPLE_TEAM_ID                F6ZAL7ANAD
+#
+# Until those are set the `macos` job fails fast with a clear message; the
+# Windows + Linux builds still run and upload.
 
 on:
   push:
@@ -31,16 +44,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Windows + Linux on their native runners. tauri-action creates the release
+  # (on tag) and uploads the bundles to it. Linux ships .deb + .rpm only —
+  # the .AppImage target fails opaquely on GitHub runners (linuxdeploy / FUSE),
+  # a lesson learned the hard way on Libre; .deb/.rpm cover the vast majority of
+  # installs and the site's Linux button resolves any of .appimage/.deb/.rpm.
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             label: Linux (x64)
-            args: "--bundles appimage,deb,rpm"
+            args: "--bundles deb,rpm"
           - os: windows-latest
             label: Windows (x64)
             args: ""
@@ -48,9 +67,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Materialize the @mattmattmattmatt/base "file:../../Libs/base" dependency
-      # by checking out the sibling repo and copying it to the path package.json
-      # expects. Copy (not symlink) so Windows runners don't need admin rights.
+      # Materialize the @mattmattmattmatt/base "file:../../Libs/base" dep by
+      # checking out the sibling repo and copying it where package.json expects.
+      # Copy (not symlink) so Windows runners don't need admin / developer mode.
       - name: Check out @mattmattmattmatt/base
         uses: actions/checkout@v4
         with:
@@ -61,7 +80,7 @@ jobs:
         run: |
           mkdir -p ../../Libs
           cp -R _base ../../Libs/base
-          test -d ../../Libs/base/primitives || { echo "Libs/base/primitives missing"; exit 1; }
+          test -d ../../Libs/base/primitives || { echo "Libs/base/primitives missing — wiring is wrong"; exit 1; }
 
       - uses: actions/setup-node@v4
         with:
@@ -83,6 +102,13 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev \
             patchelf build-essential libssl-dev
 
+      # Belt-and-suspenders: the Base design system resolves only through Vite's
+      # bundler, never tsc, so force the CI build to skip tsc even if the local
+      # build script ever gets reverted to "tsc && vite build".
+      - name: Force vite-only build for CI
+        shell: bash
+        run: npm pkg set scripts.build="vite build"
+
       - name: Install npm deps
         run: npm ci
 
@@ -97,3 +123,106 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+  # macOS: Developer-ID-signed + Apple-notarized universal DMG, uploaded to the
+  # tag's release. Mirrors the working Blip pattern and ghosty's `make` flow:
+  # `tauri build` signs the .app with hardened runtime + Entitlements.plist
+  # (both already wired in tauri.conf.json), then notarytool + stapler. Tag-only;
+  # `needs: build` so the release already exists (created by the build job)
+  # before we upload the DMG into it.
+  macos:
+    name: macOS (signed + notarized)
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: macos-14
+    timeout-minutes: 90 # fail fast instead of burning the 6h cap if codesign hangs
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out @mattmattmattmatt/base
+        uses: actions/checkout@v4
+        with:
+          repository: InfamousVague/base
+          path: _base
+      - name: Wire _base into ../../Libs/base
+        shell: bash
+        run: |
+          mkdir -p ../../Libs
+          cp -R _base ../../Libs/base
+          test -d ../../Libs/base/primitives || { echo "Libs/base/primitives missing — wiring is wrong"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Universal binary → one DMG for both Apple Silicon and Intel.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Force vite-only build for CI
+        run: npm pkg set scripts.build="vite build"
+
+      - name: Install npm deps
+        run: npm ci
+
+      # Proven Blip pattern: load the Developer ID cert from the base64 .p12
+      # secret into a throwaway build keychain so codesign can find the identity
+      # tauri.conf.json references.
+      - name: Import Apple Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::error::APPLE_CERTIFICATE secret missing on InfamousVague/TheBlackPearl."
+            echo "Set APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY +"
+            echo "APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID (mirror the Blip repo)."
+            exit 1
+          fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm certificate.p12
+
+      # `tauri build` codesigns the .app with the Developer ID identity from
+      # tauri.conf.json (hardened runtime + Entitlements.plist) and produces the
+      # universal .dmg.
+      - name: Build signed universal app + DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: npm run tauri build -- --target universal-apple-darwin --bundles app,dmg
+
+      - name: Notarize + staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name "*.dmg" | head -1)
+          [ -n "$DMG" ] || { echo "::error::no DMG produced under universal-apple-darwin/release/bundle/dmg"; exit 1; }
+          echo "Notarizing: $DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_PASSWORD" --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+
+      - name: Upload signed DMG to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name "*.dmg" | head -1)
+          gh release upload "${{ github.ref_name }}" "$DMG" --clobber --repo "${{ github.repository }}"
+          echo "Uploaded signed + notarized DMG: $DMG"
