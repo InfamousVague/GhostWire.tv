@@ -1,0 +1,378 @@
+//! Export downloaded media into tidy, app-ready libraries.
+//! Targets: Plex / a generic media folder (organized into the Plex naming
+//! convention so any server — Plex, Jellyfin, Emby, Infuse — ingests it cleanly)
+//! and Apple Music (audio; FLAC/OGG/… transcoded to ALAC). Originals are copied,
+//! so torrents keep seeding. Optional: trigger a Plex scan + AppleScript add.
+
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+
+pub const VIDEO_EXT: &[&str] = &[
+    "mp4", "mkv", "m4v", "mov", "avi", "webm", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg",
+];
+pub const AUDIO_EXT: &[&str] = &[
+    "mp3", "flac", "m4a", "aac", "wav", "aiff", "aif", "alac", "ogg", "opus", "wma",
+];
+/// Containers Apple Music imports directly; anything else is transcoded to ALAC.
+const APPLE_MUSIC_OK: &[&str] = &["mp3", "m4a", "aac", "wav", "aiff", "aif", "alac"];
+
+/// One media file found under the download folder, with parsed naming + a preview
+/// of where it would land in an organized library.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Exportable {
+    pub path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub kind: String,       // "video" | "audio"
+    pub media_type: String, // "movie" | "show" | "music"
+    pub title: String,
+    pub year: Option<i64>,
+    pub season: Option<i64>,
+    pub episode: Option<i64>,
+    /// File mtime as epoch seconds (0 if unknown) — drives the "Recently added" feed.
+    pub added_at: i64,
+    /// Relative library path it would be organized into (Plex convention).
+    pub rel_path: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub path: String,
+    pub ok: bool,
+    pub dest: Option<String>,
+    pub converted: bool,
+    pub message: String,
+}
+
+struct Parsed {
+    title: String,
+    year: Option<i64>,
+    season: Option<i64>,
+    episode: Option<i64>,
+    is_show: bool,
+}
+
+fn ext_of(p: &Path) -> String {
+    p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+}
+
+fn kind_of(ext: &str) -> Option<&'static str> {
+    if VIDEO_EXT.contains(&ext) {
+        Some("video")
+    } else if AUDIO_EXT.contains(&ext) {
+        Some("audio")
+    } else {
+        None
+    }
+}
+
+/// Replace path-hostile characters so the organized name is filesystem-safe.
+pub fn sanitize(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if "/\\:*?\"<>|".contains(c) { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Pull a clean title + year + season/episode out of a release filename stem.
+fn parse_name(stem: &str) -> Parsed {
+    let s = stem.replace(['.', '_'], " ");
+    let se = regex::Regex::new(r"(?i)\bs(\d{1,2})\s*e(\d{1,3})\b").unwrap();
+    let season_word = regex::Regex::new(r"(?i)\bseason\s+(\d{1,2})\b").unwrap();
+    let year_re = regex::Regex::new(r"\b(19|20)\d{2}\b").unwrap();
+
+    let (mut season, mut episode, mut is_show) = (None, None, false);
+    let mut head = s.clone();
+    if let Some(c) = se.captures(&s) {
+        season = c[1].parse().ok();
+        episode = c[2].parse().ok();
+        is_show = true;
+        head = s[..c.get(0).unwrap().start()].to_string();
+    } else if let Some(c) = season_word.captures(&s) {
+        season = c[1].parse().ok();
+        is_show = true;
+        head = s[..c.get(0).unwrap().start()].to_string();
+    }
+
+    let year = year_re.find(&head).and_then(|m| m.as_str().parse::<i64>().ok());
+    let lower = head.to_lowercase();
+    let mut end = head.len();
+    for m in [
+        "1080p", "720p", "2160p", "480p", "4k", "x264", "x265", "h264", "h265", "hevc", "bluray",
+        "blu-ray", "webrip", "web-dl", "web dl", "hdtv", "dvdrip", "brrip", "bdrip", "xvid",
+        "aac", "ac3", "dts", "(", "[",
+    ] {
+        if let Some(p) = lower.find(m) {
+            end = end.min(p);
+        }
+    }
+    if let Some(m) = year_re.find(&head) {
+        end = end.min(m.start());
+    }
+    let title = head[..end].trim().trim_matches(|c| c == '-' || c == '–').trim().to_string();
+    let title = if title.is_empty() { s.trim().to_string() } else { title };
+    Parsed { title, year, season, episode, is_show }
+}
+
+fn media_type(kind: &str, p: &Parsed) -> &'static str {
+    if kind == "audio" {
+        "music"
+    } else if p.is_show {
+        "show"
+    } else {
+        "movie"
+    }
+}
+
+/// Relative destination path under a library root, Plex naming convention.
+fn rel_path(p: &Parsed, kind: &str, ext: &str) -> String {
+    let t = sanitize(&p.title);
+    let t = if t.is_empty() { "Unknown".to_string() } else { t };
+    if kind == "audio" {
+        format!("Music/{t}/{t}.{ext}")
+    } else if p.is_show {
+        let ss = p.season.unwrap_or(1);
+        let ee = p.episode.unwrap_or(1);
+        format!("TV Shows/{t}/Season {ss:02}/{t} - s{ss:02}e{ee:02}.{ext}")
+    } else {
+        let name = match p.year {
+            Some(y) => format!("{t} ({y})"),
+            None => t,
+        };
+        format!("Movies/{name}/{name}.{ext}")
+    }
+}
+
+/// Recursively collect exportable media files under `root` (bounded depth).
+pub fn scan(root: &Path) -> Vec<Exportable> {
+    let mut out = Vec::new();
+    walk(root, 0, &mut out);
+    out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    out
+}
+
+fn walk(dir: &Path, depth: usize, out: &mut Vec<Exportable>) {
+    if depth > 6 || out.len() > 2000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Skip macOS dotfiles — especially AppleDouble `._*` resource forks, which carry
+        // the real file's extension (e.g. `._track.flac`) but only ~4 KB of xattrs, not
+        // audio. They sit next to every real file on exFAT/external drives, and playing
+        // one yields silence. Also skips .DS_Store, .Spotlight-V100, .Trashes, etc.
+        if path.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('.')).unwrap_or(false) {
+            continue;
+        }
+        if path.is_dir() {
+            walk(&path, depth + 1, out);
+            continue;
+        }
+        let ext = ext_of(&path);
+        let Some(kind) = kind_of(&ext) else { continue };
+        let meta = entry.metadata().ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        // Skip tiny sample/junk files.
+        if kind == "video" && size < 5 * 1024 * 1024 {
+            continue;
+        }
+        let added_at = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let parsed = parse_name(stem);
+        out.push(Exportable {
+            file_name: path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
+            size_bytes: size,
+            kind: kind.to_string(),
+            media_type: media_type(kind, &parsed).to_string(),
+            rel_path: rel_path(&parsed, kind, &ext),
+            title: parsed.title.clone(),
+            year: parsed.year,
+            season: parsed.season,
+            episode: parsed.episode,
+            added_at,
+            path: path.display().to_string(),
+        });
+    }
+}
+
+fn escape_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Add a file to the Apple Music library via AppleScript (user grants automation once).
+pub fn add_to_apple_music(path: &Path) -> Result<(), String> {
+    let script = format!(
+        "tell application \"Music\" to add POSIX file \"{}\"",
+        escape_applescript(&path.display().to_string())
+    );
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("osascript failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Transcode an audio file to ALAC in an .m4a container (lossless, Apple-native).
+pub fn transcode_to_alac(ffmpeg: &Path, src: &Path, dst: &Path) -> Result<(), String> {
+    transcode_audio(ffmpeg, src, dst, "alac")
+}
+
+/// Transcode an audio file to a portable codec ("alac" → .m4a lossless, or "mp3" →
+/// universally-playable lossy). Existing tags are carried over via `-map_metadata 0`.
+pub fn transcode_audio(ffmpeg: &Path, src: &Path, dst: &Path, codec: &str) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let codec_args: &[&str] = match codec {
+        "mp3" => &["-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", "-map_metadata", "0", "-id3v2_version", "3"],
+        _ => &["-map", "0:a:0", "-c:a", "alac", "-map_metadata", "0"],
+    };
+    let out = std::process::Command::new(ffmpeg)
+        .arg("-y")
+        .arg("-i")
+        .arg(src)
+        .args(codec_args)
+        .arg(dst)
+        .output()
+        .map_err(|e| format!("ffmpeg failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("ffmpeg error").to_string())
+    }
+}
+
+/// Copy a source file to `dest`, creating parent dirs. Skips if identical size already there.
+pub fn copy_into(src: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if let (Ok(s), Ok(d)) = (src.metadata(), dest.metadata()) {
+        if s.len() == d.len() {
+            return Ok(()); // already exported
+        }
+    }
+    std::fs::copy(src, dest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Export one file into a library root (Plex/generic). Returns the destination path.
+pub fn export_to_library(src: &Path, root: &Path) -> ExportResult {
+    let ext = ext_of(src);
+    let kind = kind_of(&ext).unwrap_or("video");
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let parsed = parse_name(stem);
+    let dest = root.join(rel_path(&parsed, kind, &ext));
+    match copy_into(src, &dest) {
+        Ok(()) => ExportResult {
+            path: src.display().to_string(),
+            ok: true,
+            dest: Some(dest.display().to_string()),
+            converted: false,
+            message: format!("Copied to {}", dest.display()),
+        },
+        Err(e) => ExportResult {
+            path: src.display().to_string(),
+            ok: false,
+            dest: None,
+            converted: false,
+            message: e,
+        },
+    }
+}
+
+/// Export one audio file into Apple Music (transcoding to ALAC if needed).
+pub fn export_to_apple_music(src: &Path, ffmpeg: Option<&Path>, staging: &Path) -> ExportResult {
+    let ext = ext_of(src);
+    if !AUDIO_EXT.contains(&ext.as_str()) {
+        return ExportResult {
+            path: src.display().to_string(),
+            ok: false,
+            dest: None,
+            converted: false,
+            message: "Apple Music export is audio-only.".to_string(),
+        };
+    }
+    let mut to_add = src.to_path_buf();
+    let mut converted = false;
+    if !APPLE_MUSIC_OK.contains(&ext.as_str()) {
+        let Some(ff) = ffmpeg else {
+            return ExportResult {
+                path: src.display().to_string(),
+                ok: false,
+                dest: None,
+                converted: false,
+                message: format!("{} needs converting to ALAC, but ffmpeg isn't installed.", ext.to_uppercase()),
+            };
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let dst = staging.join(format!("{stem}.m4a"));
+        if let Err(e) = transcode_to_alac(ff, src, &dst) {
+            return ExportResult {
+                path: src.display().to_string(),
+                ok: false,
+                dest: None,
+                converted: false,
+                message: format!("Convert failed: {e}"),
+            };
+        }
+        to_add = dst;
+        converted = true;
+    }
+    match add_to_apple_music(&to_add) {
+        Ok(()) => ExportResult {
+            path: src.display().to_string(),
+            ok: true,
+            dest: Some(to_add.display().to_string()),
+            converted,
+            message: if converted {
+                "Converted to ALAC and added to Apple Music.".to_string()
+            } else {
+                "Added to Apple Music.".to_string()
+            },
+        },
+        Err(e) => ExportResult {
+            path: src.display().to_string(),
+            ok: false,
+            dest: Some(to_add.display().to_string()),
+            converted,
+            message: format!("Couldn't add to Music: {e} (grant automation access to Music in System Settings ▸ Privacy)"),
+        },
+    }
+}
+
+/// Ask a Plex Media Server to rescan all libraries (picks up newly-copied files).
+pub async fn plex_scan(client: &reqwest::Client, server: &str, token: &str) -> Result<(), String> {
+    let base = server.trim_end_matches('/');
+    let url = format!("{base}/library/sections/all/refresh");
+    client
+        .get(&url)
+        .header("X-Plex-Token", token)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Plex unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Plex scan rejected: {e}"))?;
+    Ok(())
+}
+
+/// The staging dir for transcodes, under the app data dir.
+pub fn staging_dir(data_dir: &str) -> PathBuf {
+    PathBuf::from(data_dir).join("export-staging")
+}

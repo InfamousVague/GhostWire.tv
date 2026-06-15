@@ -1,0 +1,19 @@
+/* Float the music player as a centered dock at the bottom instead of a full-width
+   bar. Co-located + higher specificity (.npbar.npbar-dock) so it wins over the base
+   .npbar in app.css regardless of stylesheet order. */
+.npbar.npbar-dock {
+  left: 50%;
+  right: auto;
+  transform: translateX(-50%);
+  bottom: 16px;
+  width: min(760px, calc(100vw - 200px));
+  border: 1px solid var(--gg-border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+  padding: 11px 16px;
+}
+
+/* The close (X) button — a hair of separation from the volume control. */
+.npbar-dock .np-close {
+  margin-left: 4px;
+}

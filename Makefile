@@ -1,0 +1,104 @@
+# The Black Pearl — Build, Sign, Notarize, Install (mirrors Libre.academy)
+# Usage:
+#   make            — full pipeline: build → notarize → install to /Applications
+#   make build      — tauri release build (signs the .app + makes a .dmg)
+#   make notarize   — notarize + staple the .dmg with Apple
+#   make install    — copy the notarized app into /Applications
+#   make dmg        — print the path of the built DMG (the file you send people)
+#   make dev        — run in dev mode
+#   make clean      — remove build artifacts
+#
+# Credentials live in .env.apple (gitignored). Copy your existing ones:
+#   cp ../Libre.academy/.env.apple .env.apple
+
+SHELL := /bin/bash
+ROOT  := $(shell pwd)
+TAURI := $(ROOT)/src-tauri
+DMGDIR := $(TAURI)/target/release/bundle/dmg
+MACDIR := $(TAURI)/target/release/bundle/macos
+
+# Load credentials from .env.apple (gitignored). Only the signing identity is
+# exported into the build env — APPLE_ID/PASSWORD/TEAM_ID stay Make-local so a
+# plain `make build` signs but does NOT trigger Tauri's slow auto-notarize.
+-include $(ROOT)/.env.apple
+export APPLE_SIGNING_IDENTITY
+
+APPLE_ID ?= InfamousVagueRat@gmail.com
+TEAM_ID  := $(APPLE_TEAM_ID)
+TEAM_ID  ?= F6ZAL7ANAD
+
+.PHONY: all build notarize staple install dmg dev clean help
+
+## Default: full pipeline
+all: build notarize install
+	@echo ""
+	@echo "✓ Done — notarized DMG ready to send. Path:"
+	@$(MAKE) --no-print-directory dmg
+
+## Build the signed Tauri release (.app + .dmg). The .app is signed with
+## hardened runtime + Entitlements.plist using APPLE_SIGNING_IDENTITY.
+build:
+	@echo "=== Pre-build: detaching any leftover DMG mounts ==="
+	@for v in /Volumes/The\ Black\ Pearl* /Volumes/dmg.*; do \
+		[ -e "$$v" ] || continue; \
+		hdiutil detach "$$v" -force >/dev/null 2>&1 || true; \
+	done
+	@rm -f $(MACDIR)/rw.*.dmg 2>/dev/null || true
+	@if [ -z "$(APPLE_SIGNING_IDENTITY)" ]; then \
+		echo "WARN: APPLE_SIGNING_IDENTITY not set — the build won't be signed."; \
+		echo "      Create .env.apple (see .env.apple.example) first."; \
+	fi
+	@echo "=== Building signed Tauri release ==="
+	cd $(ROOT) && npm run tauri build -- --bundles app,dmg
+
+## Notarize + staple the DMG (the artifact you actually distribute).
+notarize:
+	@DMG=$$(ls -t "$(DMGDIR)"/*.dmg 2>/dev/null | head -1); \
+	if [ -z "$$DMG" ]; then echo "ERROR: no DMG in $(DMGDIR) — run 'make build' first"; exit 1; fi; \
+	if [ -z "$(APPLE_PASSWORD)" ]; then echo "ERROR: APPLE_PASSWORD not set — check .env.apple"; exit 1; fi; \
+	echo "=== Notarizing: $$DMG ==="; \
+	xcrun notarytool submit "$$DMG" \
+		--apple-id "$(APPLE_ID)" \
+		--team-id "$(TEAM_ID)" \
+		--password "$(APPLE_PASSWORD)" \
+		--wait; \
+	echo "=== Stapling ==="; \
+	xcrun stapler staple "$$DMG"; \
+	echo "✓ Notarized + stapled: $$DMG"
+
+## Staple only (if a notarization already succeeded).
+staple:
+	@DMG=$$(ls -t "$(DMGDIR)"/*.dmg 2>/dev/null | head -1); \
+	xcrun stapler staple "$$DMG"
+
+## Install the notarized app into /Applications.
+install:
+	@DMG=$$(ls -t "$(DMGDIR)"/*.dmg 2>/dev/null | head -1); \
+	if [ -z "$$DMG" ]; then echo "ERROR: no DMG to install"; exit 1; fi; \
+	echo "=== Installing from $$DMG ==="; \
+	hdiutil attach "$$DMG" -quiet -nobrowse -mountpoint /tmp/bp-dmg; \
+	APP=$$(ls -d /tmp/bp-dmg/*.app | head -1); \
+	rm -rf "/Applications/$$(basename "$$APP")"; \
+	ditto "$$APP" "/Applications/$$(basename "$$APP")"; \
+	hdiutil detach /tmp/bp-dmg -quiet; \
+	echo "✓ Installed $$(basename "$$APP") to /Applications"
+
+## Print the DMG path (the file to send to friends/family).
+dmg:
+	@ls -t "$(DMGDIR)"/*.dmg 2>/dev/null | head -1 || echo "(no DMG built yet — run 'make build')"
+
+## Verify signature + Gatekeeper acceptance of the built app.
+verify:
+	@APP=$$(ls -d "$(MACDIR)"/*.app 2>/dev/null | head -1); \
+	echo "App: $$APP"; \
+	codesign --verify --deep --strict --verbose=2 "$$APP" && echo "✓ signature valid"; \
+	spctl --assess --type execute --verbose "$$APP" || true
+
+dev:
+	cd $(ROOT) && npm run tauri dev
+
+clean:
+	rm -rf $(TAURI)/target/release/bundle
+
+help:
+	@grep -E '^##' Makefile | sed 's/## //'

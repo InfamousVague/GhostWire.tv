@@ -1,0 +1,34 @@
+/* App background: the "dark waters" photo behind the translucent glass chrome.
+   Loaded after app.css so it can clear the opaque app/body fills.
+   - ::before is the blurred water (over-extended + scaled so blur edges stay off-screen)
+   - ::after is the scrim: solid black at the very top (obscuring the top bar) fading
+     down to a light wash so the soft water texture reads through. */
+body {
+  background: #09090b;
+}
+.app {
+  background: transparent !important;
+}
+.app::before {
+  content: "";
+  position: fixed;
+  inset: -40px;
+  z-index: -2;
+  background: url("/dark-water.jpg") center / cover no-repeat;
+  filter: blur(2px) saturate(1.05);
+  transform: scale(1.03);
+  pointer-events: none;
+}
+.app::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(
+    to bottom,
+    #09090b 0%,
+    #09090b 45%,
+    rgba(9, 9, 11, 0.4) 100%
+  );
+  pointer-events: none;
+}
