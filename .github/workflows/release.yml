@@ -1,27 +1,22 @@
 name: Release
 
-# Build + publish "The Black Pearl" for macOS, Windows, and Linux, and attach
-# the bundles to a GitHub Release — which is what the download buttons on
-# mattssoftware.com resolve. Mirrors Libre's desktop-build.yml: native runner
-# per OS (cross-compiling Tauri from one host is flaky), and the
-# @mattmattmattmatt/base "file:" dependency is materialized from the sibling
-# InfamousVague/base repo before `npm ci`.
+# Build the Windows + Linux desktop bundles on tag push and attach them to the
+# GitHub Release — which is what the download buttons on mattssoftware.com
+# resolve. macOS is built + notarized locally with `make` (same split as Libre:
+# Mac signing is easiest with the Developer ID cert in the local keychain), so
+# CI covers only the platforms that can't be built on the Mac.
 #
-# Trigger: push a tag like v0.1.0  →  builds all three, creates the release.
-#          workflow_dispatch       →  ad-hoc build, artifacts on the run only.
+# The @mattmattmattmatt/base "file:../../Libs/base" dependency is materialized
+# from the sibling InfamousVague/base repo before `npm ci`, mirroring Libre.
 #
-# macOS signing + notarization needs these repo secrets (Settings → Secrets →
-# Actions). Without them the Windows/Linux jobs still succeed; only the macOS
-# job needs them (or remove the macos matrix entry and keep building Mac locally
-# with `make`):
-#   APPLE_CERTIFICATE           base64 of the Developer ID .p12
-#                               (export: `security export` to .p12, then
-#                                `base64 -i cert.p12 | pbcopy`)
-#   APPLE_CERTIFICATE_PASSWORD  the .p12 export password
-#   APPLE_SIGNING_IDENTITY      "Developer ID Application: Matt Wisniewski (F6ZAL7ANAD)"
-#   APPLE_ID                    Apple ID email
-#   APPLE_PASSWORD              app-specific password (appleid.apple.com)
-#   APPLE_TEAM_ID               F6ZAL7ANAD
+# Trigger: push a tag like v0.1.0  →  builds Windows + Linux, uploads to the
+#          release named after the tag (the macOS .dmg from `make` already
+#          lives there).  workflow_dispatch → ad-hoc build (artifacts on the run).
+#
+# To also build macOS in CI: add a `macos-latest` matrix entry with
+# `args: --target universal-apple-darwin`, set the APPLE_* repo secrets
+# (certificate base64, identity, Apple ID, app password, team id), and pass
+# them to tauri-action's env — but the local `make` flow is the supported path.
 
 on:
   push:
@@ -43,18 +38,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            label: macOS (Universal)
-            args: "--target universal-apple-darwin"
-            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - os: ubuntu-22.04
             label: Linux (x64)
             args: "--bundles appimage,deb,rpm"
-            rust-targets: ""
           - os: windows-latest
             label: Windows (x64)
             args: ""
-            rust-targets: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -80,8 +69,6 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-targets }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -99,22 +86,14 @@ jobs:
       - name: Install npm deps
         run: npm ci
 
-      - name: Build, sign, notarize & release
+      - name: Build & attach to release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS signing + notarization (used only on the macOS runner;
-          # ignored elsewhere). Empty on Windows/Linux → those just build.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('The Black Pearl {0}', github.ref_name) || '' }}
-          releaseBody: "Signed & notarized desktop builds for macOS, Windows, and Linux."
+          releaseBody: "Desktop builds for macOS, Windows, and Linux."
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
