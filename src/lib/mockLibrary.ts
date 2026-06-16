@@ -78,6 +78,26 @@ export const MOCK_DOWNLOADED: DownloadedItem[] = (() => {
       });
     });
   }
+  // A lower-quality duplicate of "Compass Rose" — exercises the Music view's
+  // exact-duplicate collapse (the smaller mp3 is hidden, the flac kept).
+  out.push({
+    id: "mock/music/midnight-cartographers/atlas-of-sleep/1-compass-rose-128.mp3",
+    title: "Compass Rose",
+    fileName: "01 Compass Rose.mp3",
+    kind: "audio",
+    mediaType: "music",
+    season: null,
+    episode: null,
+    artist: "Midnight Cartographers",
+    album: "Atlas of Sleep",
+    genre: "Indie",
+    trackNo: 1,
+    artworkUrl: null,
+    sizeBytes: 6_000_000,
+    addedAt: nowSec - 86400,
+    url: "",
+    inLibrary: true,
+  });
   VIDEOS.forEach((v) => {
     out.push({
       id: `mock/video/${slug(v.title)}.mkv`,

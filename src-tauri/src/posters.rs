@@ -201,6 +201,98 @@ pub async fn candidates(client: &reqwest::Client, title: &str, kind: &str) -> Ve
 /// (the UI and the local artwork cache fetch it like any other image).
 pub const RELAY_BASE: &str = "https://theblackpearl.tv/api";
 
+// ---- Details digest (movie/show) via the relay (read-only, server-cached) ----
+
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CastMember {
+    pub name: String,
+    #[serde(default)]
+    pub character: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+/// Full details the relay assembles for a movie/show — overview, ratings, genres,
+/// runtime, cast, poster/backdrop, and a YouTube trailer key. camelCase matches the
+/// relay JSON on the way in and the frontend on the way out.
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieDigest {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub year: Option<i64>,
+    #[serde(default)]
+    pub tmdb_id: i64,
+    #[serde(default)]
+    pub imdb_id: Option<String>,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub tagline: Option<String>,
+    #[serde(default)]
+    pub runtime_minutes: Option<i64>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub rating: Option<f64>,
+    #[serde(default)]
+    pub imdb_rating: Option<f64>,
+    #[serde(default)]
+    pub rt_rating: Option<i64>,
+    #[serde(default)]
+    pub poster: Option<String>,
+    #[serde(default)]
+    pub backdrop: Option<String>,
+    #[serde(default)]
+    pub trailer_youtube_key: Option<String>,
+    #[serde(default)]
+    pub cast: Vec<CastMember>,
+    #[serde(default)]
+    pub director: Option<String>,
+}
+
+fn relay_details_url(kind: &str, title: &str, year: Option<i64>) -> String {
+    let typ = match kind {
+        "show" | "series" | "tv" => "tv",
+        "anime" => "anime",
+        _ => "movie",
+    };
+    let mut url = reqwest::Url::parse(&format!("{RELAY_BASE}/details")).expect("valid relay url");
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("type", typ);
+        qp.append_pair("title", title);
+        if let Some(y) = year {
+            qp.append_pair("year", &y.to_string());
+        }
+    }
+    url.into()
+}
+
+/// Fetch a movie/show details digest from the relay (it fetches from TMDB/OMDb +
+/// caches server-side, so this is keyless and the relay warms its cache for everyone).
+pub async fn fetch_details(
+    client: &reqwest::Client,
+    title: &str,
+    year: Option<i64>,
+    kind: &str,
+) -> anyhow::Result<MovieDigest> {
+    let url = relay_details_url(kind, title, year);
+    let digest = client.get(&url).send().await?.error_for_status()?.json::<MovieDigest>().await?;
+    Ok(digest)
+}
+
+/// Fetch the curated featured carousel (each item a full digest) from the relay.
+pub async fn fetch_featured(client: &reqwest::Client) -> anyhow::Result<Vec<MovieDigest>> {
+    let url = format!("{RELAY_BASE}/featured");
+    let list = client.get(&url).send().await?.error_for_status()?.json::<Vec<MovieDigest>>().await?;
+    Ok(list)
+}
+
 /// Build the relay poster URL for an item. Deterministic by title/year, so it's a
 /// stable value to persist and cache.
 fn relay_poster_url(kind: &str, title: &str, year: Option<i64>) -> String {

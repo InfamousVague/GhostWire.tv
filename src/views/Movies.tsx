@@ -11,7 +11,7 @@ import { chevronLeft, circlePlay, clapperboard, folderOpen, images, library, rot
 
 interface MoviesProps {
   onPlayLocal: (item: DownloadedItem) => void;
-  posterFor?: (title: string) => string | undefined;
+  posterFor?: (title: string, kind?: string) => string | undefined;
   onReplacePoster?: (title: string) => void;
 }
 
@@ -45,7 +45,7 @@ export function Movies({ onPlayLocal, posterFor, onReplacePoster }: MoviesProps)
       <div className="series media-wide">
         <button className="series-back" onClick={() => setDetail(null)}><Icon icon={chevronLeft} size="sm" /> Movies</button>
         <div className="series-head">
-          <div className="series-art">{posterFor?.(detail.title) ? <img src={posterFor(detail.title)} alt="" /> : <Icon icon={clapperboard} size="2xl" />}</div>
+          <div className="series-art">{posterFor?.(detail.title, "movie") ? <img src={posterFor(detail.title, "movie")} alt="" /> : <Icon icon={clapperboard} size="2xl" />}</div>
           <div className="series-info">
             <h2 className="series-name">{detail.title}</h2>
             <div className="series-meta">{["Movie", fmt, formatBytes(detail.sizeBytes)].filter(Boolean).join(" · ")}</div>
@@ -85,7 +85,7 @@ export function Movies({ onPlayLocal, posterFor, onReplacePoster }: MoviesProps)
             <Card
               key={it.id}
               item={it}
-              poster={posterFor?.(it.title)}
+              poster={posterFor?.(it.title, "movie")}
               onClick={() => setDetail(it)}
               onContextMenu={(e) => ctx.open(e, fileActions(it))}
             />

@@ -16,6 +16,9 @@ interface ShowPanelProps {
   /** Start a different episode — finds a source (or a local copy) and plays it.
    *  Resolves false when nothing could be found, so the row can say so. */
   onPlayEpisode: (show: string, season: number, episode: number) => Promise<boolean>;
+  /** Anime numbers episodes absolutely (no S/E) — label them "Episode N" and show an
+   *  episode count instead of a season count. */
+  absolute?: boolean;
 }
 
 /**
@@ -23,7 +26,7 @@ interface ShowPanelProps {
  * synopsis, network, genres) plus an "Up next" button and a season-tabbed episode
  * browser. Every other episode is one click to play.
  */
-export function ShowPanel({ show, episodes, season, episode, onPlayEpisode }: ShowPanelProps) {
+export function ShowPanel({ show, episodes, season, episode, onPlayEpisode, absolute }: ShowPanelProps) {
   const seasons = useMemo(() => {
     const map = new Map<number, TvEpisode[]>();
     for (const e of episodes) {
@@ -74,13 +77,17 @@ export function ShowPanel({ show, episodes, season, episode, onPlayEpisode }: Sh
         <div className="show-meta-body">
           <h2 className="show-meta-name">{show.name}{show.year ? ` (${show.year})` : ""}</h2>
           <div className="show-meta-line">
-            {[show.network, `${seasons.length} season${seasons.length === 1 ? "" : "s"}`, show.genres.slice(0, 3).join(" · ")]
+            {[
+              show.network,
+              absolute ? `${episodes.length} episodes` : `${seasons.length} season${seasons.length === 1 ? "" : "s"}`,
+              show.genres.slice(0, 3).join(" · "),
+            ]
               .filter(Boolean)
               .join("  ·  ")}
           </div>
           {current && (
             <div className="show-now">
-              Now playing — S{pad(season)}E{pad(episode)}{current.name ? ` · ${current.name}` : ""}
+              Now playing — {absolute ? `Episode ${episode}` : `S${pad(season)}E${pad(episode)}`}{current.name ? ` · ${current.name}` : ""}
               {current.airdate ? ` · ${current.airdate}` : ""}
             </div>
           )}
@@ -92,7 +99,7 @@ export function ShowPanel({ show, episodes, season, episode, onPlayEpisode }: Sh
               loading={pending === `${next.season}-${next.number}`}
               onClick={() => play(show.name, next.season, next.number)}
             >
-              Up next · S{pad(next.season)}E{pad(next.number)}{next.name ? ` · ${next.name}` : ""}
+              Up next · {absolute ? `Episode ${next.number}` : `S${pad(next.season)}E${pad(next.number)}`}{next.name ? ` · ${next.name}` : ""}
             </Button>
           )}
         </div>

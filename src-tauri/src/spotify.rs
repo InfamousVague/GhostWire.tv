@@ -468,6 +468,7 @@ pub async fn spotify_playlist_preview(
         Err(_) => fetch_playlist_embed(&client, &id).await?,
     };
 
+    let tracks = dedupe_tracks(tracks);
     let total = tracks.len();
     if total == 0 {
         return Err("No tracks found in that playlist.".to_string());
@@ -607,6 +608,40 @@ fn clean_track_query(name: &str) -> String {
     }
 }
 
+fn norm_track_piece(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn track_dedupe_key(t: &Track) -> String {
+    if let Some(id) = t.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return format!("id:{}", id.to_ascii_lowercase());
+    }
+    if let Some(isrc) = t.isrc.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return format!("isrc:{}", isrc.to_ascii_lowercase());
+    }
+    let title = norm_track_piece(&t.name);
+    let artist = norm_track_piece(first_artist(&t.artist));
+    format!("meta:{title}:{artist}")
+}
+
+fn dedupe_tracks(tracks: Vec<Track>) -> Vec<Track> {
+    let mut out = Vec::with_capacity(tracks.len());
+    let mut seen = HashSet::new();
+    for t in tracks {
+        let key = track_dedupe_key(&t);
+        if seen.insert(key) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 pub fn parse_playlist_id(input: &str) -> Option<String> {
     let s = input.trim();
     if let Some(rest) = s.strip_prefix("spotify:playlist:") {
@@ -622,6 +657,40 @@ pub fn parse_playlist_id(input: &str) -> Option<String> {
         return Some(s.to_string());
     }
     None
+}
+
+/// Fetch a Spotify playlist as portable playlist-manifest tracks. Tries the authed
+/// Web API first (covers the user's private/collaborative playlists), then falls back
+/// to the public embed scrape (editorial/algorithmic playlists the new API blocks).
+/// Returns (playlist_name, tracks).
+pub async fn fetch_playlist_for(
+    catalog: &Catalog,
+    link: &str,
+) -> Result<(String, Vec<crate::playlist::PlaylistTrack>), String> {
+    let id = parse_playlist_id(link).ok_or_else(|| "That doesn't look like a Spotify playlist link.".to_string())?;
+    let client = http()?;
+    // Use the user token when logged in (needed for private playlists); otherwise embed.
+    let (name, tracks) = match ensure_access(catalog).await {
+        Ok(access) => match fetch_playlist(&client, &access, &id).await {
+            Ok(v) => v,
+            Err(_) => fetch_playlist_embed(&client, &id).await?,
+        },
+        Err(_) => fetch_playlist_embed(&client, &id).await?,
+    };
+    let out = dedupe_tracks(tracks)
+        .into_iter()
+        .map(|t| crate::playlist::PlaylistTrack {
+            title: t.name,
+            artist: t.artist,
+            album: t.album,
+            duration_ms: t.duration_ms,
+            isrc: t.isrc,
+            path: None,
+            spotify_url: t.url,
+            url: None,
+        })
+        .collect();
+    Ok((name, out))
 }
 
 // ---- album cover art (legitimate cover-art lookup via Spotify catalog search) ----

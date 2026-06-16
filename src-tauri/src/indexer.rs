@@ -32,6 +32,11 @@ pub async fn run_source(kind: &str, url: &str, source_name: &str, now_ms: i64) -
         "webview" => Ok(Vec::new()),
         // Generic: detect apibay JSON / TPB table / loose magnet links in whatever's fetched.
         _ => {
+            // SubsPlease/Nyaa ship structured APIs, not server-rendered magnets — route
+            // them to their adapters even if the source wasn't explicitly typed "adapter".
+            if is_subsplease(url) || is_nyaa(url) {
+                return adapter_source(url, source_name, now_ms).await;
+            }
             let body = http_get(url).await?;
             Ok(parse_body(&body, source_name, now_ms))
         }
@@ -186,6 +191,12 @@ pub async fn test_source(kind: &str, url: &str, source_name: &str, now: i64) -> 
 async fn adapter_source(url: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
     if is_1337x(url) {
         return x1337_browse(url, source_name, now).await;
+    }
+    if is_subsplease(url) {
+        return subsplease_browse(url, source_name, now).await;
+    }
+    if is_nyaa(url) {
+        return nyaa_browse(url, source_name, now).await;
     }
     let body = http_get(url).await?;
     let items = parse_body(&body, source_name, now);
@@ -572,6 +583,12 @@ pub async fn search_source(
     if is_1337x(url) {
         return x1337_search(url, q, source_name, now).await;
     }
+    if is_subsplease(url) {
+        return subsplease_search(url, q, source_name, now).await;
+    }
+    if is_nyaa(url) {
+        return nyaa_search(url, q, source_name, now).await;
+    }
 
     // scraper / adapter: try the Pirate Bay search shapes. ALWAYS try the configured
     // host first — a self-hosted or DNS-proxied mirror (e.g. a legal-torrents fork) serves
@@ -876,4 +893,311 @@ async fn x1337_resolve(
 fn guess_year(title: &str) -> Option<i64> {
     let re = regex::Regex::new(r"(19|20)\d{2}").ok()?;
     re.find(title)?.as_str().parse().ok()
+}
+
+// ---- SubsPlease adapter ----
+// SubsPlease publishes a clean keyless JSON API: the same {show, episode, downloads[],
+// image_url} object comes back for both `?f=search&s=<q>` and `?f=latest`, with every
+// release carrying its 480/720/1080 magnets directly (each magnet has an `xl=<bytes>`
+// exact size). So unlike the HTML scrapers this is a single request — no detail-page step.
+// We emit one item per (release × resolution) — every magnet is its own torrent — and
+// title it from the magnet's own `dn`, which already reads "[SubsPlease] Show (ep) (1080p)".
+
+const SUBSPLEASE_BASE: &str = "https://subsplease.org";
+
+fn is_subsplease(url: &str) -> bool {
+    url.to_lowercase().contains("subsplease")
+}
+
+/// The SubsPlease origin to hit: the user's own URL if it's a proper subsplease http(s)
+/// origin, otherwise the canonical host (the API only lives there).
+fn subsplease_base(url: &str) -> String {
+    let b = base_host(url);
+    if b.starts_with("http") && b.to_lowercase().contains("subsplease") {
+        b
+    } else {
+        SUBSPLEASE_BASE.to_string()
+    }
+}
+
+/// Pull the exact byte size from a magnet's `xl=` hint (SubsPlease always sets it).
+fn magnet_xl(magnet: &str) -> Option<i64> {
+    let query = magnet.split_once('?')?.1;
+    query.split('&').find_map(|kv| kv.strip_prefix("xl=")).and_then(|v| v.parse().ok())
+}
+
+/// Turn a SubsPlease API response into catalog items. Results come back as an object
+/// keyed by release id; an empty search is `[]` — both handled, anything else → none.
+fn parse_subsplease(base: &str, body: &str, source_name: &str, now: i64) -> Vec<CatalogItem> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(map) = val.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for release in map.values() {
+        let show = release["show"].as_str().unwrap_or("").trim();
+        let episode = release["episode"].as_str().unwrap_or("").trim();
+        let poster = release["image_url"].as_str().filter(|s| !s.is_empty()).map(|p| {
+            if p.starts_with("http") { p.to_string() } else { format!("{base}{p}") }
+        });
+        let Some(downloads) = release["downloads"].as_array() else {
+            continue;
+        };
+        for dl in downloads {
+            let Some(magnet) = dl["magnet"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let Some(id) = infohash(magnet) else {
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let res = dl["res"].as_str().unwrap_or("");
+            let title = magnet_dn(magnet)
+                .unwrap_or_else(|| format!("[SubsPlease] {show} ({episode}) ({res}p)"));
+            out.push(CatalogItem {
+                id,
+                category: guess_category(&title),
+                size_bytes: magnet_xl(magnet).unwrap_or(0),
+                seeders: 0, // SubsPlease's API doesn't expose swarm counts
+                leechers: 0,
+                year: guess_year(&title),
+                source: source_name.to_string(),
+                added_at: now,
+                files: None,
+                poster: poster.clone(),
+                description: (!show.is_empty()).then(|| format!("{show} · {res}p")),
+                magnet: magnet.to_string(),
+                title,
+            });
+        }
+    }
+    out
+}
+
+/// Live search via `?f=search&s=<query>`.
+async fn subsplease_search(url: &str, query: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = subsplease_base(url);
+    let api = format!("{base}/api/?f=search&tz=UTC&s={}", urlencode(query));
+    let body = http_get(&api).await?;
+    Ok(parse_subsplease(&base, &body, source_name, now))
+}
+
+/// Browse/refresh via `?f=latest` (the most recent releases — SubsPlease has no magnets
+/// to list without a query otherwise).
+async fn subsplease_browse(url: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = subsplease_base(url);
+    let api = format!("{base}/api/?f=latest&tz=UTC");
+    let body = http_get(&api).await?;
+    Ok(parse_subsplease(&base, &body, source_name, now))
+}
+
+// ---- Nyaa adapter ----
+// Nyaa.si exposes a rich RSS feed (`?page=rss&q=<q>`): each item carries title, size,
+// category, swarm counts (seeders/leechers/downloads) and the infoHash — but no magnet,
+// so we build one from the hash + Nyaa's own tracker. Stable XML (parsed with roxmltree,
+// like Torznab), works with the default UA (the site sits behind ddos-guard, not
+// Cloudflare). One item per torrent.
+
+const NYAA_BASE: &str = "https://nyaa.si";
+const NYAA_TRACKER: &str = "http://nyaa.tracker.wf:7777/announce";
+
+fn is_nyaa(url: &str) -> bool {
+    url.to_lowercase().contains("nyaa")
+}
+
+/// The Nyaa origin to hit: the user's own URL if it's a proper nyaa http(s) origin
+/// (mirrors like nyaa.land exist), otherwise the canonical host.
+fn nyaa_base(url: &str) -> String {
+    let b = base_host(url);
+    if b.starts_with("http") && b.to_lowercase().contains("nyaa") {
+        b
+    } else {
+        NYAA_BASE.to_string()
+    }
+}
+
+/// Build a magnet from a Nyaa infoHash: its own tracker first, then the generic public set.
+fn build_nyaa_magnet(infohash: &str, name: &str) -> String {
+    let mut trackers = format!("&tr={}", urlencode(NYAA_TRACKER));
+    for t in APIBAY_TRACKERS {
+        trackers.push_str(&format!("&tr={}", urlencode(t)));
+    }
+    format!("magnet:?xt=urn:btih:{infohash}&dn={}{trackers}", urlencode(name))
+}
+
+/// Parse a Nyaa RSS feed into catalog items. `nyaa:`-prefixed elements resolve by their
+/// local name (`seeders`, `infoHash`, …), the same way `parse_torznab` reads its feed.
+fn parse_nyaa_rss(body: &str, source_name: &str, now: i64) -> Vec<CatalogItem> {
+    let Ok(doc) = roxmltree::Document::parse(body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for item in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "item") {
+        let Some(title) = child_text(&item, "title") else {
+            continue;
+        };
+        let Some(hash) = child_text(&item, "infoHash").map(|h| h.to_ascii_lowercase()) else {
+            continue;
+        };
+        let valid = matches!(hash.len(), 40 | 32) && hash.chars().all(|c| c.is_ascii_alphanumeric());
+        if !valid || !seen.insert(hash.clone()) {
+            continue;
+        }
+        out.push(CatalogItem {
+            magnet: build_nyaa_magnet(&hash, &title),
+            category: guess_category(&title),
+            size_bytes: child_text(&item, "size").map(|s| parse_size(&s)).unwrap_or(0),
+            seeders: child_text(&item, "seeders").and_then(|s| s.parse().ok()).unwrap_or(0),
+            leechers: child_text(&item, "leechers").and_then(|s| s.parse().ok()).unwrap_or(0),
+            year: guess_year(&title),
+            source: source_name.to_string(),
+            added_at: now,
+            files: None,
+            poster: None,
+            description: child_text(&item, "category"), // e.g. "Anime - English-translated"
+            id: hash,
+            title,
+        });
+    }
+    out
+}
+
+/// Live search: Nyaa's RSS sorted by seeders (most-available first), all categories.
+async fn nyaa_search(url: &str, query: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = nyaa_base(url);
+    let api = format!("{base}/?page=rss&q={}&c=0_0&f=0&s=seeders&o=desc", urlencode(query));
+    let body = http_get(&api).await?;
+    Ok(parse_nyaa_rss(&body, source_name, now))
+}
+
+/// Browse/refresh: the latest-uploads RSS (Nyaa has nothing to list otherwise).
+async fn nyaa_browse(url: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = nyaa_base(url);
+    let api = format!("{base}/?page=rss&c=0_0&f=0");
+    let body = http_get(&api).await?;
+    Ok(parse_nyaa_rss(&body, source_name, now))
+}
+
+#[cfg(test)]
+mod subsplease_tests {
+    use super::*;
+
+    // A trimmed real `?f=search` response: one release, two resolutions. The magnets
+    // carry the live base32 btih, the percent-encoded `dn`, and the exact `xl=` size.
+    const SAMPLE: &str = r#"{
+      "abc123": {
+        "show": "Sousou no Frieren S2",
+        "episode": "01-10",
+        "image_url": "/wp-content/uploads/2026/01/154528.jpg",
+        "downloads": [
+          {"res":"480","magnet":"magnet:?xt=urn:btih:VLJ3XGIWPFSZPFC3WRVIL2UCEQFHAW2B&dn=%5BSubsPlease%5D%20Sousou%20no%20Frieren%20S2%20%2801-10%29%20%28480p%29%20%5BBatch%5D&xl=3895551825"},
+          {"res":"1080","magnet":"magnet:?xt=urn:btih:XQSSGH3FPUIV4YPGRUHBETJ76XWBAH3J&dn=%5BSubsPlease%5D%20Sousou%20no%20Frieren%20S2%20%2801-10%29%20%281080p%29%20%5BBatch%5D&xl=14669545971"}
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn parses_one_item_per_resolution_with_exact_size_and_poster() {
+        let items = parse_subsplease(SUBSPLEASE_BASE, SAMPLE, "SubsPlease", 1000);
+        assert_eq!(items.len(), 2, "one item per resolution");
+
+        let i1080 = items.iter().find(|i| i.title.contains("1080p")).expect("1080p item");
+        assert_eq!(i1080.size_bytes, 14_669_545_971, "exact size decoded from xl=");
+        assert_eq!(
+            i1080.poster.as_deref(),
+            Some("https://subsplease.org/wp-content/uploads/2026/01/154528.jpg"),
+            "relative image_url resolved against the origin"
+        );
+        assert!(i1080.title.contains("Sousou no Frieren"), "dn decoded into the title");
+        assert_eq!(i1080.category, "video");
+        assert_eq!(i1080.id.len(), 32, "base32 btih id");
+        assert!(i1080.magnet.starts_with("magnet:?xt=urn:btih:"));
+    }
+
+    #[test]
+    fn empty_search_array_yields_no_items() {
+        assert!(parse_subsplease(SUBSPLEASE_BASE, "[]", "SubsPlease", 0).is_empty());
+        assert!(parse_subsplease(SUBSPLEASE_BASE, "garbage", "SubsPlease", 0).is_empty());
+    }
+
+    // Exercises the live API end-to-end (network) — run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "network: hits the live SubsPlease API"]
+    async fn live_search_and_browse() {
+        let items = subsplease_search("https://subsplease.org", "frieren", "SubsPlease", 0).await.unwrap();
+        assert!(!items.is_empty(), "search returned results");
+        assert!(items.iter().all(|i| i.magnet.starts_with("magnet:?")), "every item has a magnet");
+        assert!(items.iter().any(|i| i.size_bytes > 0), "xl= sizes parsed");
+        assert!(items.iter().any(|i| i.poster.is_some()), "posters resolved");
+
+        let latest = subsplease_browse("https://subsplease.org", "SubsPlease", 0).await.unwrap();
+        assert!(!latest.is_empty(), "latest returned results");
+    }
+}
+
+#[cfg(test)]
+mod nyaa_tests {
+    use super::*;
+
+    // A trimmed real `?page=rss` item — namespace declared so roxmltree resolves the
+    // `nyaa:` local names exactly as the live feed does.
+    const SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa">
+  <channel>
+    <item>
+      <title>[SubsPlease] Sousou no Frieren S2 (01-10) (1080p) [Batch]</title>
+      <link>https://nyaa.si/download/2115493.torrent</link>
+      <pubDate>Fri, 29 May 2026 17:05:37 -0000</pubDate>
+      <nyaa:seeders>210</nyaa:seeders>
+      <nyaa:leechers>18</nyaa:leechers>
+      <nyaa:downloads>3735</nyaa:downloads>
+      <nyaa:infoHash>bc25231f657d115e61e68d0e124d3ff5ec101f69</nyaa:infoHash>
+      <nyaa:categoryId>1_2</nyaa:categoryId>
+      <nyaa:category>Anime - English-translated</nyaa:category>
+      <nyaa:size>13.7 GiB</nyaa:size>
+    </item>
+  </channel>
+</rss>"#;
+
+    #[test]
+    fn parses_item_with_swarm_size_and_built_magnet() {
+        let items = parse_nyaa_rss(SAMPLE, "Nyaa", 1000);
+        assert_eq!(items.len(), 1);
+        let i = &items[0];
+        assert_eq!(i.seeders, 210);
+        assert_eq!(i.leechers, 18);
+        assert_eq!(i.size_bytes, parse_size("13.7 GiB"));
+        assert_eq!(i.id, "bc25231f657d115e61e68d0e124d3ff5ec101f69");
+        assert!(i.magnet.contains("xt=urn:btih:bc25231f657d115e61e68d0e124d3ff5ec101f69"));
+        assert!(i.magnet.contains("nyaa.tracker.wf"), "Nyaa's own tracker is included");
+        assert!(i.title.contains("Frieren"));
+        assert_eq!(i.category, "video");
+        assert_eq!(i.description.as_deref(), Some("Anime - English-translated"));
+    }
+
+    #[test]
+    fn garbage_or_empty_feed_yields_no_items() {
+        assert!(parse_nyaa_rss("garbage", "Nyaa", 0).is_empty());
+        assert!(parse_nyaa_rss("<rss/>", "Nyaa", 0).is_empty());
+    }
+
+    // Live end-to-end (network) — run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "network: hits the live Nyaa RSS feed"]
+    async fn live_search_and_browse() {
+        let items = nyaa_search("https://nyaa.si", "frieren", "Nyaa", 0).await.unwrap();
+        assert!(!items.is_empty(), "search returned results");
+        assert!(items.iter().all(|i| i.magnet.starts_with("magnet:?xt=urn:btih:")), "magnets built");
+        assert!(items.iter().any(|i| i.seeders > 0), "swarm counts parsed");
+        assert!(items.iter().any(|i| i.size_bytes > 0), "sizes parsed");
+
+        let latest = nyaa_browse("https://nyaa.si", "Nyaa", 0).await.unwrap();
+        assert!(!latest.is_empty(), "latest returned results");
+    }
 }

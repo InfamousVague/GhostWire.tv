@@ -69,6 +69,8 @@ export interface MediaInfo {
   fileName: string | null;
   fileExt: string | null;
   fileSize: number;
+  /** Selected file's path relative to the download folder — drives streaming subtitles. */
+  relPath: string | null;
   files: FileEntry[];
   mediaKind: string | null; // "video" | "audio" | "other"
   endpoint: string | null; // "direct" | "transcode" | "download"

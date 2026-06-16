@@ -3,6 +3,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { CatalogItem, Category, SortKey, Source, SourceKind } from "../lib/types";
 import { IN_TAURI } from "./engine";
+import { IS_IOS } from "../lib/platform";
+import {
+  getActiveDevice,
+  remoteListCatalog,
+  remoteListDownloaded,
+  remoteListLibrary,
+  remoteLibraryStreamUrl,
+  remoteSearch,
+} from "./remote";
+
+/** Companion mode: on iOS while linked to a desktop, reads mirror that desktop over the LAN. */
+function companionDevice() {
+  return IS_IOS ? getActiveDevice() : null;
+}
 
 export function listSources(): Promise<Source[]> {
   return invoke<Source[]>("list_sources");
@@ -47,16 +61,22 @@ export function testSource(id: string): Promise<SourceTest> {
   return invoke<SourceTest>("test_source", { id });
 }
 
-/** Live-search every linked source for `query`; merged, deduped, seeders-sorted. */
+/** Live-search every linked source for `query`; merged, deduped, seeders-sorted.
+ *  Companion mode (iOS + linked desktop): searches the desktop's sources over the LAN. */
 export function searchSources(query: string): Promise<CatalogItem[]> {
+  const dev = companionDevice();
+  if (dev) return remoteSearch<CatalogItem>(dev, query);
   return invoke<CatalogItem[]>("search_sources", { query });
 }
 
+/** The indexed catalog (Discover). Companion mode: mirrors the linked desktop's catalog. */
 export function listCatalog(
   query?: string,
   category?: Category | "all",
   sort?: SortKey,
 ): Promise<CatalogItem[]> {
+  const dev = companionDevice();
+  if (dev) return remoteListCatalog<CatalogItem>(dev, query, category, sort);
   return invoke<CatalogItem[]>("list_catalog", {
     query: query || null,
     category: category && category !== "all" ? category : null,
@@ -96,6 +116,43 @@ export interface RelayStatus {
 
 export function relayStatus(): Promise<RelayStatus> {
   return invoke<RelayStatus>("relay_status");
+}
+
+export interface CastMember {
+  name: string;
+  character: string | null;
+  profile: string | null;
+}
+
+/** A movie/show details digest assembled + cached by the relay (TMDB/OMDb). */
+export interface MovieDigest {
+  kind: string;
+  title: string;
+  year: number | null;
+  tmdbId: number;
+  imdbId: string | null;
+  overview: string | null;
+  tagline: string | null;
+  runtimeMinutes: number | null;
+  genres: string[];
+  rating: number | null;
+  imdbRating: number | null;
+  rtRating: number | null;
+  poster: string | null;
+  backdrop: string | null;
+  trailerYoutubeKey: string | null;
+  cast: CastMember[];
+  director: string | null;
+}
+
+/** Fetch a movie/show digest from the relay (keyless; the relay caches it). */
+export function movieDigest(kind: string, title: string, year?: number | null): Promise<MovieDigest> {
+  return invoke<MovieDigest>("movie_digest", { kind, title, year: year ?? null });
+}
+
+/** The curated featured carousel (each a full digest), from the relay. */
+export function featured(): Promise<MovieDigest[]> {
+  return invoke<MovieDigest[]>("featured");
 }
 
 export interface MusicSpotiFlacStatus {
@@ -270,8 +327,11 @@ export function cleanTitles(ids: string[], limit?: number): Promise<CleanTitlesR
   return invoke<CleanTitlesResult>("clean_titles", { ids, limit: limit ?? null });
 }
 
-/** Scanned items joined with their metadata — the Library view. */
+/** Scanned items joined with their metadata — the Library view.
+ *  Companion mode (iOS + linked desktop): mirrors the linked desktop's Library. */
 export function listLibrary(): Promise<LibraryItem[]> {
+  const dev = companionDevice();
+  if (dev) return remoteListLibrary<LibraryItem>(dev);
   return invoke<LibraryItem[]>("list_library");
 }
 
@@ -314,6 +374,14 @@ export function tvSearch(query: string): Promise<TvShow[]> {
 /** Every episode of a show, in order, so the finder can lay out seasons/episodes. */
 export function tvEpisodes(showId: number): Promise<TvEpisode[]> {
   return invoke<TvEpisode[]>("tv_episodes", { showId });
+}
+
+/** TVMaze-backed anime check for downloaded show titles (cached server-side). Returns the
+ *  subset of `titles` tagged with the Anime genre — used by the Anime tab to surface shows
+ *  the local release-name heuristic can't judge (an organized file has no fansub tag, and a
+ *  title like "The Apothecary Diaries" carries no anime marker; the genre is only on TVMaze). */
+export function classifyAnime(titles: string[]): Promise<string[]> {
+  return invoke<string[]>("classify_anime", { titles });
 }
 
 /** A YouTube trailer key for a show (via TMDB; needs a key). Null if none. */
@@ -388,9 +456,23 @@ export interface DownloadedItem {
   inLibrary: boolean;
 }
 
-/** Everything downloaded to disk (movies / shows / music) with ready-to-play URLs. */
+/** Everything downloaded to disk (movies / shows / music) with ready-to-play URLs.
+ *  Companion mode (iOS + linked desktop): mirrors the linked desktop's on-disk Library.
+ *  Item `url`s come back as the desktop's loopback URLs — call `resolveLocalPlayUrl(item)`
+ *  at play time to turn them into a token-bearing URL on the desktop. */
 export function listDownloaded(): Promise<DownloadedItem[]> {
+  const dev = companionDevice();
+  if (dev) return remoteListDownloaded<DownloadedItem>(dev);
   return invoke<DownloadedItem[]>("list_downloaded");
+}
+
+/** The playback URL for a downloaded item. Locally that's the item's own loopback `url`;
+ *  in companion mode it's a fresh token-bearing stream URL on the linked desktop (resolved
+ *  by relpath, which is the item's `id`). The iPad buffers only — nothing is stored. */
+export async function resolveLocalPlayUrl(item: DownloadedItem): Promise<string> {
+  const dev = companionDevice();
+  if (dev) return remoteLibraryStreamUrl(dev, item.id);
+  return item.url;
 }
 
 /** Curate a downloaded item into the Library. */

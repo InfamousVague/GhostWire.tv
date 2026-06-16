@@ -21,10 +21,11 @@ import {
   type MusicSpotiFlacStatus,
 } from "../ipc/library";
 import { useDownloaded } from "../ipc/libraryCache";
+import { spotifyToPlaylist } from "../ipc/playlists";
 import { spotifyPlaylistPreview, type SpotifyTrack } from "../ipc/spotify";
 import { hueFromString } from "../lib/catalog";
 import { formatBytes } from "../lib/format";
-import { chevronLeft, circleCheck, circlePlay, disc3, download, folderOpen, images, library, link2, micVocal, music, rotateCw, sparkles, trash2, triangleAlert } from "../lib/icons";
+import { chevronLeft, circlePlay, disc3, download, folderOpen, images, library, link2, micVocal, music, rotateCw, sparkles, trash2, triangleAlert } from "../lib/icons";
 import { IS_IOS } from "../lib/platform";
 import "./Music.css";
 
@@ -157,6 +158,42 @@ function parseSpotiFlacProgress(log: string[], busy: boolean, failed: boolean): 
   return { downloaded, total };
 }
 
+function spotifyClientTokenUnauthorized(detail: string): boolean {
+  const d = detail.toLowerCase();
+  return d.includes("clienttoken.spotify.com") && d.includes("401");
+}
+
+function youtubeSearchForTrack(title: string, artist: string): string {
+  const q = [title.trim(), artist.trim()].filter(Boolean).join(" ");
+  return `https://music.youtube.com/search?q=${encodeURIComponent(q)}`;
+}
+
+function normalizeSpotifyField(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function spotifyTrackKey(track: SpotifyTrack): string {
+  const id = track.id?.trim().toLowerCase();
+  if (id) return `id:${id}`;
+  const isrc = track.isrc?.trim().toLowerCase();
+  if (isrc) return `isrc:${isrc}`;
+  const title = normalizeSpotifyField(track.name || "");
+  const artist = normalizeSpotifyField(track.artist || "");
+  return `meta:${title}::${artist}`;
+}
+
+function dedupeSpotifyTracks(tracks: SpotifyTrack[]): SpotifyTrack[] {
+  const out: SpotifyTrack[] = [];
+  const seen = new Set<string>();
+  for (const track of tracks) {
+    const key = spotifyTrackKey(track);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(track);
+  }
+  return out;
+}
+
 /**
  * Build UI track data directly from backend metadata.
  * The backend already prefers embedded file tags (SpotiFLAC-enriched) and
@@ -194,6 +231,7 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
   const [expectedPlaylistName, setExpectedPlaylistName] = useState<string | null>(null);
   const [prefetchBusy, setPrefetchBusy] = useState(false);
   const [downloadConcurrency, setDownloadConcurrency] = useState(2);
+  const [activeDownloads, setActiveDownloads] = useState(0);
   const downloadConcurrencyRef = useRef(2);
   const queuePumpRef = useRef<(() => void) | null>(null);
   const ctx = useContextMenu();
@@ -283,6 +321,17 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
     [downloadCompletedFiles, importedCount, expectedTotal, parsedProgress],
   );
 
+  const downloadRemaining = useMemo(() => {
+    if (downloadProgress.total == null) return null;
+    return Math.max(0, downloadProgress.total - downloadProgress.downloaded);
+  }, [downloadProgress.downloaded, downloadProgress.total]);
+
+  const downloadPercent = useMemo(() => {
+    if (downloadProgress.total == null || downloadProgress.total <= 0) return null;
+    const pct = Math.round((downloadProgress.downloaded / downloadProgress.total) * 100);
+    return Math.max(0, Math.min(100, pct));
+  }, [downloadProgress.downloaded, downloadProgress.total]);
+
   const baselineIdSet = useMemo(() => new Set(downloadSessionBaseIds ?? []), [downloadSessionBaseIds]);
 
   const downloadingPreviews = useMemo(() => {
@@ -318,7 +367,18 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
         albumMap.set(key, g);
       }
       if (!g.artworkUrl && p.artworkUrl) g.artworkUrl = p.artworkUrl;
-      g.tracks.push(p);
+      // Collapse duplicate copies of the same track within an album (keep the largest
+      // file). This hides dupes from the view; the Automate "Dedupe library" task
+      // removes the actual files. Keyed by track no. + normalized title.
+      const tkey = `${p.trackNo}::${p.track.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()}`;
+      const dup = g.tracks.findIndex(
+        (t) => `${t.trackNo}::${t.track.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()}` === tkey,
+      );
+      if (dup >= 0) {
+        if (p.item.sizeBytes > g.tracks[dup].item.sizeBytes) g.tracks[dup] = p;
+      } else {
+        g.tracks.push(p);
+      }
       g.addedAt = Math.max(g.addedAt, it.addedAt);
     }
     const artistMap = new Map<string, ArtistGroup>();
@@ -425,51 +485,108 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
     return actions;
   }
 
+  function onDownloadConcurrencyChange(value: number) {
+    const next = clampConcurrency(value);
+    downloadConcurrencyRef.current = next;
+    setDownloadConcurrency(next);
+  }
+
   async function runQueuedSpotifyTracks(tracks: SpotifyTrack[]) {
-    const entries = tracks
+    const uniqueTracks = dedupeSpotifyTracks(tracks);
+    const skippedDuplicates = Math.max(0, tracks.length - uniqueTracks.length);
+    const entries = uniqueTracks
       .map((track, idx) => ({
         id: track.id ?? String(idx),
         title: track.name || `Track ${idx + 1}`,
+        artist: track.artist || "",
         url: track.url?.trim() ?? "",
+        fallbackUrl: youtubeSearchForTrack(track.name || `Track ${idx + 1}`, track.artist || ""),
       }))
-      .filter((entry) => entry.url.length > 0);
+      .filter((entry) => entry.url.length > 0 || entry.fallbackUrl.length > 0);
 
     if (entries.length === 0) {
-      throw new Error("No direct Spotify track URLs were available for this playlist.");
+      throw new Error("No usable track links were available for this playlist.");
     }
+
+    const requestedConcurrency = clampConcurrency(downloadConcurrencyRef.current);
+    downloadConcurrencyRef.current = requestedConcurrency;
 
     const failures: string[] = [];
     let next = 0;
     let active = 0;
+    let spotifyTrackUrlsBlocked = false;
+    let spotifyFallbackAnnounced = false;
+
+    setDownloadLog((cur) => {
+      const nextLog = [
+        ...cur,
+        `Starting playlist queue: ${entries.length} unique tracks, up to ${requestedConcurrency} concurrent downloads.${skippedDuplicates > 0 ? ` (${skippedDuplicates} duplicates skipped.)` : ""}`,
+      ];
+      return nextLog.length > 240 ? nextLog.slice(nextLog.length - 240) : nextLog;
+    });
+    setActiveDownloads(0);
 
     await new Promise<void>((resolve) => {
       let finished = false;
       const finish = () => {
         if (finished) return;
         finished = true;
+        setActiveDownloads(0);
         queuePumpRef.current = null;
         resolve();
       };
 
       const pump = () => {
         if (finished) return;
-        const limit = clampConcurrency(downloadConcurrencyRef.current);
+        const limit = requestedConcurrency;
         while (active < limit && next < entries.length) {
           const entry = entries[next++];
           active += 1;
-          void musicSpotiFlacDownload(entry.url, downloadService, "LOSSLESS")
-            .catch((err) => {
-              failures.push(`${entry.title}: ${String(err)}`);
-            })
-            .finally(() => {
+          setActiveDownloads(active);
+          void (async () => {
+            let failed = false;
+            try {
+              const primaryUrl = spotifyTrackUrlsBlocked || !entry.url ? entry.fallbackUrl : entry.url;
+              await musicSpotiFlacDownload(primaryUrl, downloadService, "LOSSLESS");
+            } catch (err) {
+              const detail = String(err);
+              const canRetryWithYoutube = entry.fallbackUrl.length > 0 && !spotifyTrackUrlsBlocked && entry.url.length > 0;
+              if (canRetryWithYoutube && spotifyClientTokenUnauthorized(detail)) {
+                spotifyTrackUrlsBlocked = true;
+                if (!spotifyFallbackAnnounced) {
+                  spotifyFallbackAnnounced = true;
+                  setDownloadLog((cur) => {
+                    const nextLog = [
+                      ...cur,
+                      "Spotify client-token requests are being rejected (401). Falling back to YouTube Music search links for this playlist.",
+                    ];
+                    return nextLog.length > 240 ? nextLog.slice(nextLog.length - 240) : nextLog;
+                  });
+                }
+                try {
+                  await musicSpotiFlacDownload(entry.fallbackUrl, downloadService, "LOSSLESS");
+                } catch (fallbackErr) {
+                  failed = true;
+                  failures.push(`${entry.title}: ${String(fallbackErr)}`);
+                }
+              } else {
+                failed = true;
+                failures.push(`${entry.title}: ${detail}`);
+              }
+            } finally {
               active -= 1;
+              setActiveDownloads(active);
+              if (failed) {
+                // no-op; keep branch explicit for readability next to failure counting
+              }
               void refresh();
               if (next >= entries.length && active === 0) {
                 finish();
                 return;
               }
               pump();
-            });
+            }
+          })();
         }
         if (next >= entries.length && active === 0) {
           finish();
@@ -501,16 +618,30 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
     setDownloadSessionBaseIds(baselineIds);
     setExpectedTracks(null);
     setExpectedPlaylistName(null);
+    setActiveDownloads(0);
     let prefetchedTracks: SpotifyTrack[] | null = null;
     let canRunConcurrentQueue = false;
+    let playlistSaveTask: Promise<void> | null = null;
+    let playlistSavedName: string | null = null;
+    let playlistSavedCount: number | null = null;
+    let playlistSaveError: string | null = null;
     if (targetUrl.includes("open.spotify.com/playlist/") || targetUrl.includes("spotify:playlist:")) {
+      playlistSaveTask = spotifyToPlaylist(targetUrl)
+        .then((playlist) => {
+          playlistSavedName = playlist.name;
+          playlistSavedCount = playlist.tracks.length;
+        })
+        .catch((err) => {
+          playlistSaveError = String(err);
+        });
       setPrefetchBusy(true);
       try {
         const preview = await spotifyPlaylistPreview(targetUrl);
-        setExpectedTracks(preview.tracks);
+        const uniqueTracks = dedupeSpotifyTracks(preview.tracks);
+        setExpectedTracks(uniqueTracks);
         setExpectedPlaylistName(preview.playlist);
-        prefetchedTracks = preview.tracks;
-        canRunConcurrentQueue = preview.tracks.length > 0 && preview.tracks.every((track) => Boolean(track.url?.trim()));
+        prefetchedTracks = uniqueTracks;
+        canRunConcurrentQueue = uniqueTracks.length > 0;
       } catch {
         // Prefetch is best-effort; importing still continues.
       } finally {
@@ -521,7 +652,16 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
       if (canRunConcurrentQueue && prefetchedTracks) {
         await runQueuedSpotifyTracks(prefetchedTracks);
       } else {
+        setActiveDownloads(1);
         await musicSpotiFlacDownload(targetUrl, downloadService, "LOSSLESS");
+      }
+      if (playlistSaveTask) {
+        await playlistSaveTask;
+        if (playlistSavedName && typeof playlistSavedCount === "number") {
+          setDownloadMessage(`Saved playlist \"${playlistSavedName}\" with ${playlistSavedCount} track${playlistSavedCount === 1 ? "" : "s"}.`);
+        } else if (playlistSaveError) {
+          setDownloadMessage("Import finished, but saving a playlist manifest failed.");
+        }
       }
       setDownloadDone(true);
       setDownloadUrl("");
@@ -530,6 +670,7 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
       setDownloadError(String(e));
     } finally {
       queuePumpRef.current = null;
+      setActiveDownloads(0);
       setDownloadBusy(false);
     }
   }
@@ -718,7 +859,7 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
               Concurrent downloads
               <select
                 value={downloadConcurrency}
-                onChange={(e) => setDownloadConcurrency(clampConcurrency(parseInt(e.currentTarget.value, 10)))}
+                onChange={(e) => onDownloadConcurrencyChange(parseInt(e.currentTarget.value, 10))}
                 style={{
                   minWidth: 74,
                   borderRadius: 8,
@@ -732,6 +873,7 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
                   <option key={n} value={n}>{n}</option>
                 ))}
               </select>
+              {downloadBusy && <span className="music-concurrency-active">{activeDownloads} active</span>}
             </label>
             {!spotiStatus?.available && (
               <Button
@@ -750,7 +892,7 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
               <Icon icon={triangleAlert} size="sm" /> SpotiFLAC is not installed.
             </p>
           )}
-          {(downloadBusy || prefetchBusy || visibleQueue.length > 0) && (
+          {(downloadBusy || prefetchBusy) && (
             <div className="field" style={{ borderTop: "1px solid color-mix(in srgb, var(--outline-variant, rgba(255,255,255,0.12)) 100%, transparent)", paddingTop: 12 }}>
               <label className="field-label">Incoming tracks{expectedPlaylistName ? ` • ${expectedPlaylistName}` : ""}</label>
               {prefetchBusy ? (
@@ -803,15 +945,47 @@ export function Music({ onPlayLocal, onReplacePoster }: MusicProps) {
               )}
             </div>
           )}
+          {(prefetchBusy || downloadBusy) && (
+            <div className="music-import-progress" aria-live="polite">
+              <div className="music-import-progress-head">
+                <span className="field-label">Import progress</span>
+                <span className="field-hint">
+                  {downloadProgress.total != null
+                    ? `${downloadProgress.downloaded} of ${downloadProgress.total} imported${downloadRemaining != null ? ` • ${downloadRemaining} left` : ""}`
+                    : prefetchBusy
+                      ? "Loading playlist tracks..."
+                      : "Waiting for first completed track..."}
+                </span>
+              </div>
+              <div
+                className={`music-import-progress-track${downloadPercent == null ? " is-indeterminate" : ""}`}
+                role={downloadPercent == null ? "status" : "progressbar"}
+                aria-label="Music import progress"
+                aria-valuemin={downloadPercent == null ? undefined : 0}
+                aria-valuemax={downloadPercent == null ? undefined : 100}
+                aria-valuenow={downloadPercent == null ? undefined : downloadPercent}
+              >
+                <div
+                  className="music-import-progress-fill"
+                  style={downloadPercent == null ? undefined : { width: `${downloadPercent}%` }}
+                />
+              </div>
+              {downloadBusy && (
+                <p className="field-hint">
+                  {downloadProgress.total != null
+                    ? `Imported ${downloadProgress.downloaded} of ${downloadProgress.total} tracks so far.`
+                    : "Import in progress..."}
+                  {` Active: ${activeDownloads} / ${downloadConcurrency}.`}
+                </p>
+              )}
+            </div>
+          )}
           {downloadError && <p className="field-hint" style={{ color: "var(--gg-danger, #d85b5b)" }}>{downloadError}</p>}
           {!downloadError && downloadMessage && <p className="settings-status">{downloadMessage}</p>}
           {!downloadBusy && !downloadError && downloadDone && downloadProgress.total != null && (
             <p className="field-hint" style={{ color: "var(--gg-success, #2f8f4e)" }}>
               Finished importing {downloadProgress.total} track{downloadProgress.total === 1 ? "" : "s"}.
             </p>
-          )}
-          {downloadBusy && downloadProgress.total != null && (
-            <p className="field-hint">Imported {downloadProgress.downloaded} of {downloadProgress.total} tracks so far.</p>
           )}
           {!IN_TAURI && <p className="field-hint">SpotiFLAC downloads run in the desktop app.</p>}
           {spotiStatus?.hint && <p className="field-hint">{spotiStatus.hint}</p>}

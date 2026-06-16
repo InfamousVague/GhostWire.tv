@@ -17,6 +17,15 @@ export function addTorrent(magnet: string): Promise<string> {
   return invoke<string>("add_torrent", { magnet });
 }
 
+/** PIN + this Mac's LAN address to display so another device (iPad) can link to it. */
+export interface PairingInfo {
+  pin: string;
+  address: string;
+}
+export function pairingPin(): Promise<PairingInfo> {
+  return invoke<PairingInfo>("pairing_pin");
+}
+
 /** Local HTTP URL (range-capable) the <video> streams from. fileIdx omitted = largest media file. */
 export function getStreamUrl(id: string, fileIdx?: number): Promise<string> {
   return invoke<string>("stream_url", { id, fileIdx: fileIdx ?? null });
@@ -41,6 +50,24 @@ export interface SubTrack {
 /** Subtitle tracks for a local video by its relative path under the download folder. */
 export function listSubtitles(rel: string): Promise<SubTrack[]> {
   return invoke<SubTrack[]>("list_subtitles", { rel });
+}
+
+/** Fetch a subtitle (free, keyless, via OpenSubtitles) for a video that has none; saves it
+ *  next to the file and resolves to the refreshed track list. */
+export function fetchSubtitles(
+  rel: string,
+  title: string,
+  season?: number | null,
+  episode?: number | null,
+  lang?: string,
+): Promise<SubTrack[]> {
+  return invoke<SubTrack[]>("fetch_subtitles", {
+    rel,
+    title,
+    season: season ?? null,
+    episode: episode ?? null,
+    lang: lang ?? null,
+  });
 }
 
 export function listDownloads(): Promise<DownloadStats[]> {

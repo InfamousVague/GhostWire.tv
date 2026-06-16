@@ -1,0 +1,192 @@
+/* Playlists view, restyled to match the Music landing language. */
+
+.pl-head-actions,
+.pl-new-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pl-new-row :global(.base-input),
+.pl-rename-row :global(.base-input) {
+  min-width: 220px;
+}
+
+.pl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(186px, 1fr));
+  gap: 18px;
+}
+
+.pl-poster-card {
+  border: none;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+
+.pl-source-row {
+  margin-top: 1px;
+  color: var(--gg-text-dim);
+}
+
+.pl-rename-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pl-export {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.pl-format {
+  appearance: none;
+  background: var(--gg-surface-2);
+  color: var(--gg-text);
+  border: 1px solid var(--gg-border);
+  border-radius: 8px;
+  padding: 0 28px 0 12px;
+  font-size: 13px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'><path d='M6 9l6 6 6-6'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+}
+
+.pl-hint {
+  margin-top: 8px;
+}
+
+.pl-tracks {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--gg-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.pl-track {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--gg-border);
+  opacity: 0.6;
+}
+
+.pl-track:first-child {
+  border-top: none;
+}
+
+.pl-track.has-file {
+  opacity: 1;
+}
+
+.pl-track:hover {
+  background: var(--gg-surface);
+}
+
+.pl-track-idx {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: none;
+  border-radius: 6px;
+  cursor: default;
+  color: var(--gg-text-muted);
+  font-size: 12px;
+}
+
+.pl-track.has-file .pl-track-idx {
+  cursor: pointer;
+}
+
+.pl-track.has-file .pl-track-idx:hover {
+  background: var(--gg-accent);
+  color: #fff;
+}
+
+.pl-play-glyph {
+  display: grid;
+  place-items: center;
+  color: var(--gg-accent);
+}
+
+.pl-track.has-file .pl-track-idx:hover .pl-play-glyph {
+  color: #fff;
+}
+
+.pl-track-meta {
+  min-width: 0;
+}
+
+.pl-track-name {
+  font-size: 14px;
+  color: var(--gg-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pl-track-artist {
+  font-size: 12px;
+  color: var(--gg-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pl-track-dur {
+  font-size: 12px;
+  color: var(--gg-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pl-track-x {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: none;
+  border-radius: 6px;
+  color: var(--gg-text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.pl-track:hover .pl-track-x {
+  opacity: 1;
+}
+
+.pl-track-x:hover {
+  background: var(--gg-surface-2);
+  color: var(--gg-hot);
+}
+
+.pl-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  padding: 48px 16px;
+  color: var(--gg-text-dim);
+}
+
+.pl-empty > :global(svg) {
+  color: var(--gg-text-muted);
+  margin-bottom: 6px;
+}
+
+.pl-empty p {
+  margin: 0;
+}

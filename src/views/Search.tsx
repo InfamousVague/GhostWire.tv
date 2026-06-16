@@ -5,11 +5,12 @@ import { Button } from "@mattmattmattmatt/base/primitives/button/Button";
 import { Spinner } from "@mattmattmattmatt/base/primitives/spinner/Spinner";
 import { PosterCard } from "../components/PosterCard";
 import { PosterRow } from "../components/PosterRow";
-import { Hero } from "../components/Hero";
+import { FeaturedCarousel } from "../components/FeaturedCarousel";
+import { AnimeDiscoverRows } from "../components/AnimeDiscoverRows";
 import type { CatalogItem, Category, SortKey } from "../lib/types";
-import type { LibraryItem } from "../ipc/library";
+import type { LibraryItem, MovieDigest } from "../ipc/library";
 import { isAnime, ANIME_GENRES, type MediaSectionId } from "../lib/media";
-import { CATEGORY_LABEL, qualityOf, QUALITIES, sortCatalog, streamFormat, type Quality } from "../lib/catalog";
+import { CATEGORY_LABEL, cleanRelease, qualityOf, QUALITIES, sortCatalog, streamFormat, type Quality } from "../lib/catalog";
 import { anime as animeIcon, arrowDownUp, clapperboard, history, link2, music, plus, search as searchIcon, trendingUp, tv } from "../lib/icons";
 
 /** Strongest billboard candidate: prefer a poster + synopsis, then most-seeded. */
@@ -30,6 +31,8 @@ interface SearchProps {
   popular: string[];
   /** Browsable catalog grouped by media type — powers the billboard + carousels. */
   sections: Record<MediaSectionId, LibraryItem[]>;
+  /** Curated featured digests from the relay (carousel). Falls back to the local pool. */
+  featured: MovieDigest[];
   onSearch: (q: string) => void;
   onAddMagnet: (m: string) => void;
   onClearRecents: () => void;
@@ -68,6 +71,7 @@ export function Search({
   recents,
   popular,
   sections,
+  featured,
   onSearch,
   onAddMagnet,
   onClearRecents,
@@ -122,7 +126,33 @@ export function Search({
     () => [...sections.movies, ...sections.tvshows, ...sections.music],
     [sections],
   );
-  const featured = useMemo(() => pickFeatured(pool), [pool]);
+  // Featured carousel: the relay's curated digests, else the top of the local pool
+  // mapped into the same digest shape (poster as backdrop; no trailer without the relay).
+  const featuredSlides = useMemo<MovieDigest[]>(() => {
+    if (featured.length > 0) return featured.slice(0, 6);
+    return [...pool]
+      .sort((a, b) => b.seeders - a.seeders)
+      .slice(0, 5)
+      .map((it) => ({
+        kind: "movie",
+        title: it.cleanTitle || cleanRelease(it.title.replace(/^\[[^\]]*\]\s*/, "")),
+        year: it.year ?? null,
+        tmdbId: 0,
+        imdbId: null,
+        overview: it.description ?? null,
+        tagline: null,
+        runtimeMinutes: null,
+        genres: it.genre ? [it.genre] : [],
+        rating: null,
+        imdbRating: it.imdbRating ?? null,
+        rtRating: it.rtRating ?? null,
+        poster: it.poster ?? null,
+        backdrop: it.poster ?? null,
+        trailerYoutubeKey: null,
+        cast: [],
+        director: null,
+      }));
+  }, [featured, pool]);
   const trending = useMemo(() => [...pool].sort((a, b) => b.seeders - a.seeders).slice(0, 24), [pool]);
   const animeItems = useMemo(
     () => [...sections.movies, ...sections.tvshows].filter((it) => isAnime(it)).sort((a, b) => b.seeders - a.seeders).slice(0, 24),
@@ -154,11 +184,11 @@ export function Search({
 
       {idle ? (
         <div className="home">
-          {featured && (
-            <Hero item={featured} onPlay={() => onPlay(featured)} onQueue={() => onQueue(featured)} />
+          {featuredSlides.length > 0 && (
+            <FeaturedCarousel items={featuredSlides} onFind={onSearch} />
           )}
 
-          {!featured &&
+          {featuredSlides.length === 0 &&
             trending.length === 0 &&
             sections.movies.length === 0 &&
             sections.tvshows.length === 0 &&
@@ -202,6 +232,8 @@ export function Search({
               ))}
             </PosterRow>
           )}
+          {/* Popular/trending/seasonal anime from AniList + MyAnimeList → run a search. */}
+          <AnimeDiscoverRows onSearch={onSearch} />
           {sections.music.length > 0 && (
             <PosterRow title="Music" count={sections.music.length}>
               {sections.music.slice(0, 24).map((it) => (

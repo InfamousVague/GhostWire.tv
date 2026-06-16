@@ -3,7 +3,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -120,8 +120,11 @@ pub struct LibraryItem {
     pub tags: Option<String>,
 }
 
+/// `Clone` is cheap: the SQLite connection lives behind `Arc<Mutex<…>>`, so a clone
+/// shares the same connection (used to hand a handle to the LAN engine server).
+#[derive(Clone)]
 pub struct Catalog {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Catalog {
@@ -129,7 +132,7 @@ impl Catalog {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Catalog {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 

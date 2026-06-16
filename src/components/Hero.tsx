@@ -2,6 +2,7 @@ import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Button } from "@mattmattmattmatt/base/primitives/button/Button";
 import { Chip } from "@mattmattmattmatt/base/primitives/chip/Chip";
 import type { LibraryItem } from "../ipc/library";
+import { seasonEpisodeLabel } from "../lib/catalog";
 import { circlePlay, film, plus } from "../lib/icons";
 
 interface HeroProps {
@@ -18,7 +19,7 @@ interface HeroProps {
  */
 export function Hero({ item, onPlay, onQueue }: HeroProps) {
   const title = item.cleanTitle || item.title;
-  const meta = [item.year, item.genre, item.quality].filter(Boolean).join("  ·  ");
+  const meta = [seasonEpisodeLabel(item.title), item.year, item.genre, item.quality].filter(Boolean).join("  ·  ");
   const hasRatings = item.imdbRating != null || item.rtRating != null;
 
   return (

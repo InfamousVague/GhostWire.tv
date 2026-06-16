@@ -163,3 +163,69 @@
   gap: 7px;
   margin: 4px 0 -6px;
 }
+
+.music-concurrency-active {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 74px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--outline-variant, rgba(255, 255, 255, 0.12)) 100%, transparent);
+  background: color-mix(in srgb, var(--surface-2, rgba(255, 255, 255, 0.08)) 72%, transparent);
+  color: var(--text, #fff);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.music-import-progress {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--outline-variant, rgba(255, 255, 255, 0.12)) 100%, transparent);
+  background: color-mix(in srgb, var(--surface-1, rgba(255, 255, 255, 0.04)) 100%, transparent);
+}
+
+.music-import-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.music-import-progress-track {
+  position: relative;
+  height: 10px;
+  width: 100%;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--outline-variant, rgba(255, 255, 255, 0.14)) 100%, transparent);
+  background: color-mix(in srgb, var(--surface-2, rgba(255, 255, 255, 0.08)) 100%, transparent);
+}
+
+.music-import-progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2fbf71 0%, #67d68a 55%, #9be8ad 100%);
+  transition: width 220ms ease;
+}
+
+.music-import-progress-track.is-indeterminate .music-import-progress-fill {
+  width: 36%;
+  animation: music-import-indeterminate 1.25s ease-in-out infinite;
+}
+
+@keyframes music-import-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(290%);
+  }
+}

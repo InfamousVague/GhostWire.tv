@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Card } from "@mattmattmattmatt/base/primitives/card/Card";
+import { LinkDeviceCard } from "../components/LinkDeviceCard";
 import { Input } from "@mattmattmattmatt/base/primitives/input/Input";
 import { Button } from "@mattmattmattmatt/base/primitives/button/Button";
 import { IN_TAURI } from "../ipc/engine";
@@ -20,10 +21,14 @@ import {
 } from "../ipc/library";
 import { circleCheck, cpu, download, film, folderDown, folderOpen, globe, hardDrive, info, rotateCw, server, sparkles, triangleAlert } from "../lib/icons";
 import { IS_IOS } from "../lib/platform";
+import type { SettingsTab } from "../lib/settingsTabs";
+import "./Settings.css";
 
 type UpdatePhase = "idle" | "checking" | "current" | "available" | "downloading" | "ready" | "error";
 
-export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void }) {
+/** The active category (`tab`) is owned by App and surfaced in the shell Sidebar card, so
+ *  this view just renders the matching pane. */
+export function Settings({ onCatalogChanged, tab }: { onCatalogChanged: () => void; tab: SettingsTab }) {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [tmdbKey, setTmdbKey] = useState("");
   const [omdbKey, setOmdbKey] = useState("");
@@ -189,6 +194,9 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         <span className="cat-title">Settings</span>
       </div>
 
+      <div className="settings-pane">
+
+      {tab === "general" && (
       <Card variant="outlined" padding="lg">
         <div className="settings-group">
           <h4 className="settings-h"><Icon icon={info} size="sm" /> About &amp; updates</h4>
@@ -228,6 +236,9 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         </div>
       </Card>
 
+      )}
+
+      {tab === "storage" && (
       <Card variant="outlined" padding="lg">
         <div className="settings-group">
           <h4 className="settings-h">Storage</h4>
@@ -267,6 +278,9 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         </div>
       </Card>
 
+      )}
+
+      {tab === "media" && (<>
       <Card variant="outlined" padding="lg">
         <div className="settings-group">
           <h4 className="settings-h"><Icon icon={sparkles} size="sm" /> Automatic cleanup</h4>
@@ -323,6 +337,9 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         </div>
       </Card>
 
+      </>)}
+
+      {tab === "artwork" && (
       <Card variant="outlined" padding="lg">
         <div className="settings-group">
           <h4 className="settings-h">Posters, ratings &amp; music APIs</h4>
@@ -362,6 +379,13 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         </div>
       </Card>
 
+      )}
+
+      {tab === "network" && (<>
+      <Card variant="outlined" padding="lg">
+        <LinkDeviceCard />
+      </Card>
+
       <Card variant="outlined" padding="lg">
         <div className="settings-group">
           <h4 className="settings-h"><Icon icon={server} size="sm" /> Connection</h4>
@@ -387,6 +411,9 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         </div>
       </Card>
 
+      </>)}
+
+      {tab === "advanced" && (
       <Card variant="outlined" padding="lg">
         <div className="settings-group">
           <h4 className="settings-h">Catalog</h4>
@@ -406,8 +433,11 @@ export function Settings({ onCatalogChanged }: { onCatalogChanged: () => void })
         </div>
       </Card>
 
+      )}
+
       {status && <p className="settings-status">{status}</p>}
       {!IN_TAURI && <p className="field-hint">Settings actions run in the desktop app.</p>}
+        </div>
     </div>
   );
 }

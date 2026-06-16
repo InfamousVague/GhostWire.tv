@@ -12,9 +12,10 @@ const LIBRARY_TABS = new Set<NavId>(["library", "movies", "tvshows", "anime", "m
 
 // Top-level navigation ids. The first group are content sections shown in the rail's
 // top cluster; the second are management destinations in the bottom cluster.
+// ("playlists" lives inside the Music tab now, not the rail.)
 export type NavId =
   | "library" | "discover" | "tvshows" | "anime" | "movies" | "music"
-  | "downloads" | "export" | "automation" | "sources" | "settings";
+  | "playlists" | "downloads" | "export" | "automation" | "sources" | "settings";
 
 interface RailEntry {
   id: NavId;

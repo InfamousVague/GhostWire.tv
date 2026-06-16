@@ -3,6 +3,7 @@
 //! `<video>` element can stream it while it's still downloading.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -11,13 +12,17 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
-    extract::{Path as AxPath, State as AxState},
-    http::{header, HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path as AxPath, Query as AxQuery, State as AxState},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
-use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions};
+use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig};
+
+use crate::catalog::Catalog;
+use crate::remote::{self, DeviceIdentity, Pairing};
+use crate::AppInfo;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -67,6 +72,20 @@ struct ServerState {
     art_dir: PathBuf,
     /// Download root — local finished files are served at /file/{relpath} for the Library.
     download_dir: PathBuf,
+    // --- LAN device-linking (the Mac acts as host for a linked iPad) ---
+    /// librqbit session, so `/api/add_torrent` can start downloads on this host.
+    session: Arc<Session>,
+    /// HMAC key for verifying bearer + stream tokens from LAN clients.
+    secret: String,
+    device_name: String,
+    device_id: String,
+    /// Current PIN pairing offer (set by the `pairing_pin` command).
+    pairing: Pairing,
+    // --- companion-mode mirroring (a linked iPad fully mirrors this desktop) ---
+    /// Shared SQLite catalog handle, so the LAN API can serve Discover/catalog + Library.
+    catalog: Catalog,
+    /// App paths + ffmpeg flag, so the LAN API can run the same on-disk Library scan.
+    app_info: AppInfo,
 }
 
 /// Mirrors the TS `DownloadStats` interface (camelCase over the wire).
@@ -106,6 +125,10 @@ pub struct MediaInfo {
     file_name: Option<String>,
     file_ext: Option<String>,
     file_size: u64,
+    /// Path of the selected file relative to the download folder — lets the player look
+    /// up subtitles (sidecar + embedded) for a torrent that's still streaming, not just
+    /// already-downloaded local files.
+    rel_path: Option<String>,
     files: Vec<FileEntry>,
     /// "video" | "audio" | "other" — drives how the UI plays it (and whether the
     /// encoder is allowed to touch it at all).
@@ -138,30 +161,64 @@ pub struct Engine {
     download_dir: PathBuf,
     transcode_errors: TranscodeErrors,
     hls: HlsJobs,
+    /// Shared PIN pairing offer — the `pairing_pin` command writes here; `/api/pair` reads it.
+    pairing: Pairing,
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         app: AppHandle,
         download_dir: PathBuf,
         art_dir: PathBuf,
         ffmpeg: Option<PathBuf>,
         ffprobe: Option<PathBuf>,
+        identity: DeviceIdentity,
+        catalog: Catalog,
+        app_info: AppInfo,
     ) -> Result<Engine> {
         // Don't re-bind a *persisted* DHT port: librqbit otherwise re-uses a port saved
         // in the data dir, so a second instance sharing that dir (e.g. the dev build
         // running alongside the installed app) collides on it and the whole app aborts
         // during setup. A fresh ephemeral DHT port per launch lets instances coexist.
+        // Persist the torrent set (+ fastresume) under the data dir so downloads resume
+        // where they left off after a relaunch, instead of starting over. DHT persistence
+        // stays off (see above) — only the torrent list/progress is restored.
         let session = Session::new_with_opts(
             download_dir.clone(),
             SessionOptions {
                 disable_dht_persistence: true,
+                persistence: Some(SessionPersistenceConfig::Json {
+                    folder: Some(PathBuf::from(&app_info.data_dir).join("rqbit-session")),
+                }),
                 ..Default::default()
             },
         )
         .await
         .context("creating librqbit session")?;
         let torrents: Torrents = Arc::new(RwLock::new(HashMap::new()));
+
+        // Adopt any torrents librqbit restored from the persistence store into our own
+        // registry, so resumed downloads show up in the UI and stay streamable. Keyed by
+        // the same lowercase-hex infohash everything else uses.
+        {
+            let restored: Vec<(String, Handle)> = session.with_torrents(|it| {
+                it.map(|(_tid, h)| (h.info_hash().as_string(), h.clone())).collect()
+            });
+            if !restored.is_empty() {
+                let mut map = torrents.write().await;
+                for (id, handle) in restored {
+                    let title = handle.name().unwrap_or_else(|| id.clone());
+                    let magnet = format!("magnet:?xt=urn:btih:{id}");
+                    map.entry(id).or_insert(Entry {
+                        handle,
+                        title,
+                        magnet,
+                        added: std::time::Instant::now(),
+                    });
+                }
+            }
+        }
         let transcode_errors: TranscodeErrors = Arc::new(RwLock::new(HashMap::new()));
         let hls: HlsJobs = Arc::new(RwLock::new(HashMap::new()));
         let hls_root = std::env::temp_dir().join("ghosty-hls");
@@ -172,6 +229,7 @@ impl Engine {
         // Loopback media server. /stream serves raw bytes with Range (direct play);
         // /hls serves an ffmpeg HLS playlist + segments for formats WKWebView can't play
         // natively — HLS needs no byte-range, unlike a progressive <video src> MP4.
+        let pairing = remote::new_pairing();
         let state = ServerState {
             torrents: torrents.clone(),
             ffmpeg: ffmpeg.clone(),
@@ -181,6 +239,13 @@ impl Engine {
             hls_root: hls_root.clone(),
             art_dir: art_dir.clone(),
             download_dir: download_dir.clone(),
+            session: session.clone(),
+            secret: identity.secret.clone(),
+            device_name: identity.name.clone(),
+            device_id: identity.id.clone(),
+            pairing: pairing.clone(),
+            catalog,
+            app_info,
         };
         let router = Router::new()
             .route("/stream/{id}/{file}", get(stream_handler))
@@ -193,18 +258,42 @@ impl Engine {
             .route("/subs/embed/{token}/{name}", get(subs_embed_handler))
             .route("/art/{id}", get(art_handler))
             .route("/file/{*relpath}", get(file_handler))
-            .with_state(state)
+            // LAN control API for a linked iPad (see remote.rs). `/api/pair` is open
+            // (PIN-gated); the rest require a bearer token via the auth middleware below.
+            .route("/api/pair", post(api_pair))
+            .route("/api/device_info", get(api_device_info))
+            .route("/api/list_downloads", get(api_list_downloads))
+            .route("/api/add_torrent", post(api_add_torrent))
+            .route("/api/stream_url", get(api_stream_url))
+            // Companion mode: a linked iPad mirrors this desktop's Library / catalog / search.
+            .route("/api/list_downloaded", get(api_list_downloaded))
+            .route("/api/list_library", get(api_list_library))
+            .route("/api/list_catalog", get(api_list_catalog))
+            .route("/api/search", get(api_search))
+            .route("/api/library_stream_url", get(api_library_stream_url))
+            // Auth runs INNER (after CORS) so even 401s carry CORS headers. Localhost (the
+            // desktop app's own webview) is exempt; LAN requests must present a valid token.
+            .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
             // Allow the WKWebView page (a different origin) to read these responses with
             // CORS — required so a Web Audio AnalyserNode can tap the <audio> element for
             // the visualizer instead of getting silenced (zeroed) samples. Applied to ALL
             // responses, including 206 Partial Content range responses.
-            .layer(axum::middleware::from_fn(cors_headers));
-        let addr = format!("127.0.0.1:{STREAM_PORT}");
+            .layer(axum::middleware::from_fn(cors_headers))
+            .with_state(state);
+        // The Mac (desktop) exposes the server on the LAN so a linked iPad can reach it;
+        // the auth middleware gates non-localhost requests. iOS stays loopback-only — it's
+        // a client, and its own WKWebView reaches 127.0.0.1 under the local-network exemption.
+        let addr = if cfg!(target_os = "ios") {
+            format!("127.0.0.1:{STREAM_PORT}")
+        } else {
+            format!("0.0.0.0:{STREAM_PORT}")
+        };
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("binding stream server on {addr}"))?;
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
+            let svc = router.into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(e) = axum::serve(listener, svc).await {
                 eprintln!("ghosty: stream server exited: {e}");
             }
         });
@@ -231,38 +320,19 @@ impl Engine {
             download_dir,
             transcode_errors,
             hls,
+            pairing,
         })
     }
 
     /// Add a magnet; returns its infohash (the id everything else is keyed by).
     pub async fn add(&self, magnet: &str) -> Result<String> {
-        let id = infohash_from_magnet(magnet).ok_or_else(|| anyhow!("no btih infohash in magnet"))?;
-        let resp = self
-            .session
-            .add_torrent(
-                AddTorrent::from_url(magnet),
-                Some(AddTorrentOptions {
-                    overwrite: true, // allow resuming an already-downloaded torrent
-                    ..Default::default()
-                }),
-            )
-            .await
-            .context("add_torrent")?;
-        let handle = match resp {
-            AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
-            AddTorrentResponse::ListOnly(_) => return Err(anyhow!("list-only response")),
-        };
-        let title = magnet_title(magnet).unwrap_or_else(|| id.clone());
-        self.torrents.write().await.insert(
-            id.clone(),
-            Entry {
-                handle,
-                title,
-                magnet: magnet.to_string(),
-                added: std::time::Instant::now(),
-            },
-        );
-        Ok(id)
+        add_magnet(&self.session, &self.torrents, magnet).await
+    }
+
+    /// Create a fresh PIN pairing offer for a LAN client to enter; returns it for the
+    /// host UI to display.
+    pub async fn offer_pairing_pin(&self) -> String {
+        remote::offer_pin(&self.pairing).await
     }
 
     /// Wait for metadata, then hand back the loopback URL the player streams from.
@@ -327,6 +397,35 @@ impl Engine {
                     });
                 }
             }
+
+            // 1b) A sibling Subs/ (or Subtitles/) folder — the common scene-release layout
+            // (`Release/Release.mkv` + `Release/Subs/2_English.srt`). Take every track in it.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for sub_dir in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+                    let dn = sub_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                    if !matches!(dn.as_str(), "subs" | "subtitles" | "sub") {
+                        continue;
+                    }
+                    let Ok(inner) = std::fs::read_dir(&sub_dir) else { continue };
+                    let mut subs: Vec<PathBuf> = inner
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| matches!(file_ext(p).as_str(), "srt" | "vtt" | "ass" | "ssa"))
+                        .collect();
+                    subs.sort();
+                    for p in subs {
+                        let sub_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                        let Ok(sub_rel) = p.strip_prefix(&self.download_dir) else { continue };
+                        let sub_rel = sub_rel.to_string_lossy().replace('\\', "/");
+                        let lang = sub_lang(&sub_stem);
+                        out.push(SubTrack {
+                            label: sub_label(&sub_stem, &lang),
+                            lang,
+                            url: format!("http://127.0.0.1:{STREAM_PORT}/subs/file/{}", hls_token(&sub_rel)),
+                        });
+                    }
+                }
+            }
         }
 
         // 2) Embedded text subtitle streams (ffprobe enumerates; ffmpeg extracts on demand).
@@ -347,6 +446,34 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// Fetch a subtitle for `rel` from OpenSubtitles (free, keyless) when it has none,
+    /// save it next to the video as `<stem>.<lang>.srt`, and return the refreshed track
+    /// list. `title`/`season`/`episode` come from the player's already-parsed metadata.
+    pub async fn fetch_subtitles(
+        &self,
+        rel: &str,
+        title: &str,
+        season: Option<i64>,
+        episode: Option<i64>,
+        lang: &str,
+    ) -> Result<Vec<SubTrack>> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(25))
+            .build()
+            .context("subtitle http client")?;
+        if let Some(found) = crate::subtitles::fetch_best(&client, title, season, episode, lang).await? {
+            let abs = self.download_dir.join(rel);
+            if let (Some(dir), Some(stem)) = (abs.parent(), abs.file_stem().and_then(|s| s.to_str())) {
+                std::fs::create_dir_all(dir).ok();
+                let dest = dir.join(format!("{stem}.{}.srt", found.lang));
+                if !dest.exists() {
+                    std::fs::write(&dest, found.srt).context("writing subtitle")?;
+                }
+            }
+        }
+        Ok(self.list_subtitles(rel).await)
     }
 
     pub async fn stats_for(&self, id: &str) -> Option<DownloadStats> {
@@ -472,6 +599,7 @@ impl Engine {
             file_name: None,
             file_ext: None,
             file_size: 0,
+            rel_path: None,
             files: Vec::new(),
             media_kind: None,
             endpoint: None,
@@ -512,6 +640,7 @@ impl Engine {
                 _ if web_native => "web-native (MP4/WebM) → direct".to_string(),
                 _ => "ffmpeg unavailable → direct".to_string(),
             });
+            info.rel_path = name.clone();
             info.file_name = name;
 
             // Probe codecs only for actual media — never run ffprobe on a disk image / archive.
@@ -633,22 +762,385 @@ fn media_kind(name: &str) -> &'static str {
     }
 }
 
-fn play_url(ffmpeg_on: bool, id: &str, file: usize, name: Option<&str>) -> String {
-    // Non-web-native VIDEO needs help to play in WKWebView. With ffmpeg (desktop) we
-    // transcode to HLS. Without it (iOS), Matroska whose codecs are already web-compatible
-    // (H.264/HEVC + AAC) is repackaged to fragmented MP4 in-process — no re-encode. Audio
-    // and everything else streams raw.
+/// The server-relative playback path for a file (no host). Non-web-native VIDEO needs help
+/// to play in WKWebView: with ffmpeg (desktop) we transcode to HLS; without it (iOS),
+/// Matroska whose codecs are already web-compatible (H.264/HEVC + AAC) is repackaged to
+/// fragmented MP4 in-process — no re-encode. Audio and everything else streams raw.
+fn play_path(ffmpeg_on: bool, id: &str, file: usize, name: Option<&str>) -> String {
     let kind = name.map_or("video", media_kind);
     let non_native = name.map_or(true, |n| !is_web_native(n));
     if kind == "video" && non_native {
         if ffmpeg_on {
-            return format!("http://127.0.0.1:{STREAM_PORT}/hls/{id}/{file}/index.m3u8");
+            return format!("/hls/{id}/{file}/index.m3u8");
         }
         if name.is_some_and(is_matroska) {
-            return format!("http://127.0.0.1:{STREAM_PORT}/remux/{id}/{file}");
+            return format!("/remux/{id}/{file}");
         }
     }
-    format!("http://127.0.0.1:{STREAM_PORT}/stream/{id}/{file}")
+    format!("/stream/{id}/{file}")
+}
+
+/// Full loopback URL the local (same-device) player streams from.
+fn play_url(ffmpeg_on: bool, id: &str, file: usize, name: Option<&str>) -> String {
+    format!("http://127.0.0.1:{STREAM_PORT}{}", play_path(ffmpeg_on, id, file, name))
+}
+
+/// Decides iPad-native playback from the **probed** container + codecs (not the filename).
+/// The companion iPad plays via WKWebView's HTML5 `<video>` — which, unlike native AVPlayer,
+/// only decodes an MP4/MOV-family container carrying H.264/HEVC video and AAC/MP3 (or no)
+/// audio. Everything else must be transcoded by the Mac even when the extension says
+/// `.mp4`/`.mov`: AC-3/E-AC-3/DTS/Opus audio (the #1 real-world failure — a `.mp4` with a
+/// Dolby track plays on the desktop but silently dies in `<video>`), and VP9/AV1/VP8/XviD
+/// video (the A16 iPad has no AV1 or VP9 hardware decoder and WebKit has no software
+/// fallback). ffprobe's `format_name` is a comma-joined demuxer list — MP4/MOV/M4V all probe
+/// as `mov,mp4,m4a,3gp,3g2,mj2`, while MKV and WebM are indistinguishable (`matroska,webm`) —
+/// so containers are matched by substring. Unknown/None container or video codec returns
+/// `false` (conservative: transcode), so a failed/timed-out probe never hands the iPad a
+/// direct URL it can't play.
+fn ios_native(container: Option<&str>, vcodec: Option<&str>, acodec: Option<&str>) -> bool {
+    // Container must be the MP4/QuickTime family; bar MKV/WebM/AVI/TS even if codecs are fine.
+    let Some(c) = container.map(|s| s.to_lowercase()) else { return false };
+    let container_ok = (c.contains("mp4") || c.contains("mov") || c.contains("m4a")
+        || c.contains("m4v") || c.contains("3gp") || c.contains("mj2") || c.contains("quicktime"))
+        && !c.contains("matroska") && !c.contains("webm") && !c.contains("avi") && !c.contains("mpegts");
+    if !container_ok {
+        return false;
+    }
+    // Video must be H.264 or HEVC (accept the MP4 sample-entry aliases). None ⇒ transcode.
+    let Some(v) = vcodec.map(|s| s.to_lowercase()) else { return false };
+    if !matches!(v.as_str(), "h264" | "avc1" | "hevc" | "h265" | "hvc1") {
+        return false; // vp9, av1, vp8, mpeg4, msmpeg4v3, vc1, wmv3, …
+    }
+    // Audio: a video-only file (None) is fine; otherwise the default track must be AAC/MP3.
+    // flac/alac/vorbis can play in MP4 but are unreliable on the `<video>` audio path, and
+    // ac3/eac3/dts/opus never play — transcode all of them.
+    match acodec.map(|s| s.to_lowercase()) {
+        None => true,
+        Some(a) => matches!(a.as_str(), "aac" | "mp4a" | "mp3"),
+    }
+}
+
+/// Shared add path used by both `Engine::add` and the `/api/add_torrent` handler.
+async fn add_magnet(session: &Arc<Session>, torrents: &Torrents, magnet: &str) -> Result<String> {
+    let id = infohash_from_magnet(magnet).ok_or_else(|| anyhow!("no btih infohash in magnet"))?;
+    let resp = session
+        .add_torrent(
+            AddTorrent::from_url(magnet),
+            Some(AddTorrentOptions {
+                overwrite: true, // allow resuming an already-downloaded torrent
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("add_torrent")?;
+    let handle = match resp {
+        AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
+        AddTorrentResponse::ListOnly(_) => return Err(anyhow!("list-only response")),
+    };
+    let title = magnet_title(magnet).unwrap_or_else(|| id.clone());
+    torrents.write().await.insert(
+        id.clone(),
+        Entry {
+            handle,
+            title,
+            magnet: magnet.to_string(),
+            added: std::time::Instant::now(),
+        },
+    );
+    Ok(id)
+}
+
+// ===================== LAN control API (linked iPad → Mac host) =====================
+
+/// Gate non-localhost requests. Localhost (the desktop app's own webview) passes through.
+/// On the LAN: `/api/pair` is open (PIN-gated), other `/api/*` need a Bearer token, and the
+/// streaming endpoints need a `?tk=` token (a <video> can't send Authorization headers).
+async fn auth_middleware(
+    AxState(state): AxState<ServerState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_local = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(true);
+    let path = req.uri().path();
+    // `/api/pair` is PIN-gated; `/art/` is just cached poster images (non-sensitive, and an
+    // <img> can't carry a token) so it's open on the LAN too.
+    if is_local || path == "/api/pair" || path.starts_with("/art/") || req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+    let authorized = if path.starts_with("/api/") {
+        req.headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| remote::verify_token(&state.secret, t))
+    } else {
+        // /stream /remux /hls /file /art /subs … : token in the query string (?tk=…)
+        req.uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("tk=")))
+            .is_some_and(|t| remote::verify_token(&state.secret, t))
+    };
+    if authorized {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PairReq {
+    pin: String,
+}
+#[derive(Serialize)]
+struct PairResp {
+    token: String,
+    device_id: String,
+    name: String,
+}
+/// PIN handshake → long-lived bearer token. Open endpoint (the PIN is the gate).
+async fn api_pair(AxState(state): AxState<ServerState>, Json(body): Json<PairReq>) -> Response {
+    if remote::consume_pin(&state.pairing, &body.pin).await {
+        let token = remote::mint_token(&state.secret, remote::BEARER_TTL_SECS);
+        Json(PairResp {
+            token,
+            device_id: state.device_id.clone(),
+            name: state.device_name.clone(),
+        })
+        .into_response()
+    } else {
+        (StatusCode::UNAUTHORIZED, "bad or expired pin").into_response()
+    }
+}
+
+#[derive(Serialize)]
+struct DeviceInfoResp {
+    device_id: String,
+    name: String,
+    version: String,
+}
+async fn api_device_info(AxState(state): AxState<ServerState>) -> Response {
+    Json(DeviceInfoResp {
+        device_id: state.device_id.clone(),
+        name: state.device_name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+    .into_response()
+}
+
+async fn api_list_downloads(AxState(state): AxState<ServerState>) -> Response {
+    Json(build_snapshot(&state.torrents, state.ffmpeg.is_some()).await).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct AddReq {
+    magnet: String,
+}
+#[derive(Serialize)]
+struct AddResp {
+    id: String,
+}
+async fn api_add_torrent(AxState(state): AxState<ServerState>, Json(body): Json<AddReq>) -> Response {
+    match add_magnet(&state.session, &state.torrents, &body.magnet).await {
+        Ok(id) => Json(AddResp { id }).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct StreamUrlReq {
+    id: String,
+    file: Option<usize>,
+}
+#[derive(Serialize)]
+struct StreamUrlResp {
+    url: String,
+}
+/// Returns a server-RELATIVE playback path + a short-lived stream token; the client prepends
+/// the Mac's base URL. The Mac has ffmpeg, so non-web-native video routes through /hls and
+/// plays on the iPad regardless of codec.
+async fn api_stream_url(
+    AxState(state): AxState<ServerState>,
+    AxQuery(q): AxQuery<StreamUrlReq>,
+) -> Response {
+    let handle = match state.torrents.read().await.get(&q.id).map(|e| e.handle.clone()) {
+        Some(h) => h,
+        None => return (StatusCode::NOT_FOUND, "unknown torrent").into_response(),
+    };
+    for _ in 0..300 {
+        if matches!(handle.stats().state, librqbit::TorrentStatsState::Live) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let file = q.file.or_else(|| largest_file(&handle)).unwrap_or(0);
+    let name = file_name(&handle, file);
+    let kind = name.as_deref().map_or("video", media_kind);
+    let mut path = play_path(state.ffmpeg.is_some(), &q.id, file, name.as_deref());
+    // Codec-aware override for the paired iPad: the extension may say `.mp4`/`.mov` while the
+    // bytes carry AC-3/DTS audio or VP9/AV1 video that WKWebView's `<video>` can't decode — so
+    // the Mac (which has ffmpeg) probes the real codecs and transcodes on the iPad's behalf
+    // instead of handing it a direct URL that just fails. Only probe video that wasn't already
+    // routed to /hls by extension; on probe timeout/failure ios_native() is false → transcode.
+    if kind == "video" && state.ffmpeg.is_some() && !path.starts_with("/hls/") {
+        let input = format!("http://127.0.0.1:{STREAM_PORT}/stream/{}/{}", q.id, file);
+        let (container, vcodec, acodec) = tokio::time::timeout(
+            Duration::from_secs(20),
+            media_probe(state.ffprobe.as_deref(), &input),
+        )
+        .await
+        .unwrap_or((None, None, None));
+        if !ios_native(container.as_deref(), vcodec.as_deref(), acodec.as_deref()) {
+            path = format!("/hls/{}/{}/index.m3u8", q.id, file);
+        }
+    }
+    let tk = remote::mint_token(&state.secret, remote::STREAM_TTL_SECS);
+    let sep = if path.contains('?') { '&' } else { '?' };
+    Json(StreamUrlResp {
+        url: format!("{path}{sep}tk={tk}"),
+    })
+    .into_response()
+}
+
+// ===================== Companion mode (linked iPad mirrors this desktop) =====================
+// These serve this desktop's own data — the on-disk Library scan, the curated Library, the
+// indexed catalog (Discover), and a live source search — so a paired iPad shows EXACTLY what
+// the desktop shows. The iPad streams/plays from this host and never downloads or stores
+// anything itself. All sit behind the bearer-token auth middleware.
+
+/// The desktop's on-disk Library scan (movies / shows / music). Each item's `url` carries a
+/// loopback `127.0.0.1` URL the iPad ignores — it plays via `/api/library_stream_url` instead.
+async fn api_list_downloaded(AxState(state): AxState<ServerState>) -> Response {
+    let info = state.app_info.clone();
+    let catalog = state.catalog.clone();
+    // The scan is a synchronous disk walk + tag read; keep it off the async runtime.
+    match tokio::task::spawn_blocking(move || crate::scan_downloaded(&info, &catalog)).await {
+        Ok(items) => Json(items).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "scan failed").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LimitReq {
+    limit: Option<i64>,
+}
+/// The desktop's curated Library (scanned + AI-enriched items).
+async fn api_list_library(
+    AxState(state): AxState<ServerState>,
+    AxQuery(q): AxQuery<LimitReq>,
+) -> Response {
+    match state.catalog.list_library(q.limit.unwrap_or(1000)) {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CatalogReq {
+    query: Option<String>,
+    category: Option<String>,
+    sort: Option<String>,
+}
+/// The desktop's indexed catalog (Discover) — same filtering/sorting as the local command.
+async fn api_list_catalog(
+    AxState(state): AxState<ServerState>,
+    AxQuery(q): AxQuery<CatalogReq>,
+) -> Response {
+    match state.catalog.list_items(
+        q.query.as_deref(),
+        q.category.as_deref(),
+        q.sort.as_deref().unwrap_or("popularity"),
+        1000,
+    ) {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SearchReq {
+    q: String,
+}
+/// Live source search on the desktop (its sources + ffmpeg), returned to the iPad.
+async fn api_search(
+    AxState(state): AxState<ServerState>,
+    AxQuery(q): AxQuery<SearchReq>,
+) -> Response {
+    match crate::search_sources_core(&state.catalog, &q.q).await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LibraryStreamReq {
+    relpath: String,
+}
+/// A token-bearing, server-RELATIVE playback path for a FINISHED Library file (by its path
+/// relative to the download root). Mirrors how `scan_downloaded` builds local `/file` URLs:
+/// non-web-native video the desktop can transcode goes via `/localhls` (the desktop has
+/// ffmpeg), everything else streams raw from `/file`. The iPad prepends the Mac base URL.
+async fn api_library_stream_url(
+    AxState(state): AxState<ServerState>,
+    AxQuery(q): AxQuery<LibraryStreamReq>,
+) -> Response {
+    let rel = q.relpath.trim_start_matches('/');
+    if rel.is_empty() || rel.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad relpath").into_response();
+    }
+    let abs = PathBuf::from(&state.app_info.download_dir).join(rel);
+    if !tokio::fs::metadata(&abs).await.map(|m| m.is_file()).unwrap_or(false) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let tk = remote::mint_token(&state.secret, remote::STREAM_TTL_SECS);
+    // Codec-aware route for the paired iPad. `local_transcodes` already catches extensions
+    // WKWebView can't decode (mkv/avi/ts/wmv…) — those skip the probe. Video whose extension
+    // *looks* native (.mp4/.mov/.m4v/.webm) is probed on disk so a mislabeled file (e.g. an
+    // .mp4 with an AC-3 track) is transcoded via /localhls instead of failing on the iPad.
+    let path = if state.app_info.ffmpeg_available && media_kind(rel) == "video" {
+        let needs_transcode = if local_transcodes(rel) {
+            true
+        } else {
+            let (container, vcodec, acodec) = tokio::time::timeout(
+                Duration::from_secs(20),
+                media_probe(state.ffprobe.as_deref(), &abs.to_string_lossy()),
+            )
+            .await
+            .unwrap_or((None, None, None));
+            !ios_native(container.as_deref(), vcodec.as_deref(), acodec.as_deref())
+        };
+        if needs_transcode {
+            format!("/localhls/{}/index.m3u8", hls_token(rel))
+        } else {
+            format!("/file/{}", enc_path_rel(rel))
+        }
+    } else {
+        format!("/file/{}", enc_path_rel(rel))
+    };
+    let sep = if path.contains('?') { '&' } else { '?' };
+    Json(StreamUrlResp {
+        url: format!("{path}{sep}tk={tk}"),
+    })
+    .into_response()
+}
+
+/// Percent-encode each path segment so spaces / unicode survive the `/file/{*relpath}` URL.
+/// Local equivalent of `lib::enc_path` (kept here so the engine has no cross-module dep).
+fn enc_path_rel(rel: &str) -> String {
+    rel.split('/')
+        .map(|seg| {
+            seg.chars()
+                .flat_map(|c| match c {
+                    'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => vec![c.to_string()],
+                    _ => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Matroska family — the containers our in-process remux can read.
@@ -854,15 +1346,26 @@ fn largest_file(handle: &Arc<ManagedTorrent>) -> Option<usize> {
         .flatten()
 }
 
-/// Adds permissive CORS headers to every loopback response so the cross-origin
-/// WKWebView page can read media bytes (un-taints audio for the Web Audio analyser).
+/// Adds permissive CORS headers to every response so the cross-origin WKWebView page can
+/// read media bytes (un-taints audio for the Web Audio analyser) AND call the `/api/*`
+/// control endpoints from a linked iPad. A CORS preflight (OPTIONS) is answered here with
+/// 204 — otherwise it would route to a POST-only handler and 405, blocking the real request.
 async fn cors_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let mut res = next.run(req).await;
+    use axum::http::HeaderValue;
+    let mut res = if req.method() == Method::OPTIONS {
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap()
+    } else {
+        next.run(req).await
+    };
     let h = res.headers_mut();
-    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
-    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, axum::http::HeaderValue::from_static("GET, HEAD, OPTIONS"));
-    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, axum::http::HeaderValue::from_static("range, content-type"));
-    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, axum::http::HeaderValue::from_static("content-range, content-length, accept-ranges"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, HEAD, OPTIONS"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("range, content-type, authorization"));
+    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("content-range, content-length, accept-ranges"));
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     res
 }
 
@@ -1022,8 +1525,16 @@ async fn remux_handler(
 /// any ffmpeg hasn't reached yet (backward seeks are instant, forward seeks buffer).
 async fn hls_playlist_handler(
     AxPath((id, file)): AxPath<(String, usize)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     AxState(state): AxState<ServerState>,
 ) -> Response {
+    // Propagate any ?tk= stream token onto the segment URIs so a LAN client's per-segment
+    // fetches carry it through the auth middleware (a <video> can't add headers per segment).
+    let tk_suffix = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("tk=")))
+        .map(|t| format!("?tk={t}"))
+        .unwrap_or_default();
     let ffmpeg = match &state.ffmpeg {
         Some(p) => p.clone(),
         None => return (StatusCode::NOT_IMPLEMENTED, "ffmpeg not installed").into_response(),
@@ -1060,7 +1571,7 @@ async fn hls_playlist_handler(
         );
         for i in 0..n {
             let d = if i + 1 == n { (duration - (i as f64) * HLS_SEG).max(0.1) } else { HLS_SEG };
-            m3u8.push_str(&format!("#EXTINF:{d:.3},\nseg{i:05}.ts\n"));
+            m3u8.push_str(&format!("#EXTINF:{d:.3},\nseg{i:05}.ts{tk_suffix}\n"));
         }
         m3u8.push_str("#EXT-X-ENDLIST\n");
         return (
@@ -1078,12 +1589,21 @@ async fn hls_playlist_handler(
     for _ in 0..150 {
         if let Ok(content) = std::fs::read_to_string(&ff) {
             if content.contains(".ts") {
+                let body = if tk_suffix.is_empty() {
+                    content
+                } else {
+                    content
+                        .lines()
+                        .map(|l| if l.ends_with(".ts") { format!("{l}{tk_suffix}") } else { l.to_string() })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 return (
                     [
                         (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
                         (header::CACHE_CONTROL, "no-store"),
                     ],
-                    content,
+                    body,
                 )
                     .into_response();
             }
@@ -1162,8 +1682,14 @@ fn stable_hash(s: &str) -> u64 {
 
 async fn local_hls_playlist_handler(
     AxPath(token): AxPath<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     AxState(state): AxState<ServerState>,
 ) -> Response {
+    let tk_suffix = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("tk=")))
+        .map(|t| format!("?tk={t}"))
+        .unwrap_or_default();
     let ffmpeg = match &state.ffmpeg {
         Some(p) => p.clone(),
         None => return (StatusCode::NOT_IMPLEMENTED, "ffmpeg not installed").into_response(),
@@ -1202,7 +1728,7 @@ async fn local_hls_playlist_handler(
         );
         for i in 0..n {
             let d = if i + 1 == n { (duration - (i as f64) * HLS_SEG).max(0.1) } else { HLS_SEG };
-            m3u8.push_str(&format!("#EXTINF:{d:.3},\nseg{i:05}.ts\n"));
+            m3u8.push_str(&format!("#EXTINF:{d:.3},\nseg{i:05}.ts{tk_suffix}\n"));
         }
         m3u8.push_str("#EXT-X-ENDLIST\n");
         return (
@@ -1219,12 +1745,21 @@ async fn local_hls_playlist_handler(
     for _ in 0..150 {
         if let Ok(content) = std::fs::read_to_string(&ff) {
             if content.contains(".ts") {
+                let body = if tk_suffix.is_empty() {
+                    content
+                } else {
+                    content
+                        .lines()
+                        .map(|l| if l.ends_with(".ts") { format!("{l}{tk_suffix}") } else { l.to_string() })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 return (
                     [
                         (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
                         (header::CACHE_CONTROL, "no-store"),
                     ],
-                    content,
+                    body,
                 )
                     .into_response();
             }

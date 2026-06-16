@@ -65,6 +65,36 @@ export function cleanRelease(raw: string): string {
   return t || raw.trim();
 }
 
+/**
+ * Pull season/episode out of a raw release name (S01E02, 1x02, "Season 1 Episode 2", or a
+ * bare season pack). Returns nulls for non-episodic titles (movies, music). Used to keep
+ * the season/episode visible after the clean title has stripped it.
+ */
+export function parseSeasonEpisode(raw: string): { season: number | null; episode: number | null } {
+  if (!raw) return { season: null, episode: null };
+  const t = raw.replace(/[._]/g, " ");
+  let m = t.match(/\bS(\d{1,2})\s?E(\d{1,3})\b/i); // S01E02 / S1 E2
+  if (m) return { season: +m[1], episode: +m[2] };
+  m = t.match(/\b(\d{1,2})x(\d{1,3})\b/i); // 1x02
+  if (m) return { season: +m[1], episode: +m[2] };
+  m = t.match(/\bseason\s+(\d{1,2})\b.*?\bepisode\s+(\d{1,3})\b/i); // Season 1 Episode 2
+  if (m) return { season: +m[1], episode: +m[2] };
+  m = t.match(/\bS(\d{1,2})\s*[-–]\s*(\d{1,3})\b/i); // S2 - 23 (anime: season + dashed episode)
+  if (m) return { season: +m[1], episode: +m[2] };
+  m = t.match(/\bseason\s+(\d{1,2})\b/i); // Season 1 (pack)
+  if (m) return { season: +m[1], episode: null };
+  m = t.match(/\bS(\d{1,2})\b(?![\dEe])/i); // S01 (pack)
+  if (m) return { season: +m[1], episode: null };
+  return { season: null, episode: null };
+}
+
+/** Compact "S5 · E14" / "Season 5" label from a raw title, or "" when not episodic. */
+export function seasonEpisodeLabel(raw: string): string {
+  const { season, episode } = parseSeasonEpisode(raw);
+  if (season == null) return "";
+  return episode != null ? `S${season} · E${episode}` : `Season ${season}`;
+}
+
 /** Stable hue derived from a string, used for placeholder poster gradients. */
 export function hueFromString(s: string): number {
   let h = 0;

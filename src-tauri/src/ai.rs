@@ -59,6 +59,44 @@ struct GenResp {
     response: String,
 }
 
+/// The model's verdict on a candidate group of same-artist/same-title tracks.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct DedupeVerdict {
+    /// True only when these are the SAME recording saved more than once.
+    #[serde(default)]
+    pub duplicate: bool,
+    /// Index of the copy to keep (the others are duplicates to remove).
+    #[serde(default)]
+    pub keep: i64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+const DEDUPE_PROMPT: &str = "You are de-duplicating a music library. Below are music files that share an artist and a very similar title. They might be the SAME recording saved more than once, or genuinely DIFFERENT versions that should both be kept — a live take, a remaster, an acoustic or radio edit, a re-recording, or a different mix/album. Judge carefully: only call them duplicates if they are the same recording. If they are duplicates, choose the index to keep (prefer the highest quality — the largest file).\nFiles (0-indexed):\n";
+
+/// Ask the local model whether a candidate group is a true duplicate set, and which
+/// copy to keep. Errs (so the caller skips the group) when Ollama is down or replies
+/// with non-JSON. Same call shape as `parse_music`.
+pub async fn dedupe_judge(client: &reqwest::Client, model: &str, context: &str) -> Result<DedupeVerdict> {
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": format!("{DEDUPE_PROMPT}{context}\nRespond with ONLY a JSON object using exactly these keys: {{\"duplicate\": true or false, \"keep\": <index to keep>, \"reason\": \"<short reason>\"}}\nJSON:"),
+        "format": "json",
+        "stream": false,
+        "options": { "temperature": 0.0 }
+    });
+    let resp: GenResp = client
+        .post(format!("{OLLAMA}/api/generate"))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let text = resp.response.trim();
+    serde_json::from_str(text).map_err(|e| anyhow!("LLM returned non-JSON ({e}): {text}"))
+}
+
 /// Structured parse of a single release name.
 #[derive(Deserialize, Default, Clone, Debug)]
 pub struct Parsed {

@@ -22,7 +22,7 @@ interface TvShowsProps {
   onPlay: (item: CatalogItem) => void;
   /** Download a found pack/episode without streaming (adds to the library). */
   onAddToLibrary: (item: CatalogItem) => void;
-  posterFor?: (title: string) => string | undefined;
+  posterFor?: (title: string, kind?: string) => string | undefined;
   /** Open the "replace poster" picker for a show title. */
   onReplacePoster?: (title: string) => void;
 }
@@ -93,7 +93,7 @@ export function TvShows({ onPlayLocal, onPlay, onAddToLibrary, posterFor, onRepl
       <ShowDetail
         title={open.title}
         local={open.episodes}
-        poster={posterFor?.(open.title)}
+        poster={posterFor?.(open.title, "show")}
         onPlayLocal={onPlayLocal}
         onPlayTorrent={onPlay}
         onAddTorrent={onAddToLibrary}
@@ -129,7 +129,7 @@ export function TvShows({ onPlayLocal, onPlay, onAddToLibrary, posterFor, onRepl
               key={s.title}
               title={s.title}
               sub={`${s.episodes.length} episode${s.episodes.length === 1 ? "" : "s"}`}
-              poster={posterFor?.(s.title)}
+              poster={posterFor?.(s.title, "show")}
               onClick={() => setOpenTitle(s.title)}
               onContextMenu={(e) => ctx.open(e, showActions(s.title, s.episodes))}
             />

@@ -1,6 +1,7 @@
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import type { NavId } from "./NavigationRail";
 import { SECTION_LABEL, type MediaSectionId, type SectionSort } from "../lib/media";
+import { SETTINGS_TABS, type SettingsTab } from "../lib/settingsTabs";
 import { arrowDownUp, history, tag, trendingUp } from "../lib/icons";
 
 // NavId is a superset of the content sections; this narrows it.
@@ -30,6 +31,9 @@ interface SidebarProps {
   popular: string[];
   onPick: (q: string) => void;
   onClearRecents: () => void;
+  // settings sub-nav
+  settingsTab: SettingsTab;
+  onSettingsTab: (t: SettingsTab) => void;
 }
 
 export function Sidebar(props: SidebarProps) {
@@ -41,11 +45,32 @@ export function Sidebar(props: SidebarProps) {
           <DiscoverFilters {...props} />
         ) : isMedia(section) ? (
           <SectionFilters {...props} section={section} />
+        ) : section === "settings" ? (
+          <SettingsNav {...props} />
         ) : (
           <ManageInfo section={section} />
         )}
       </div>
     </aside>
+  );
+}
+
+function SettingsNav({ settingsTab, onSettingsTab }: SidebarProps) {
+  return (
+    <>
+      <div className="side-title">Settings</div>
+      <div className="side-group">
+        {SETTINGS_TABS.map((t) => (
+          <button
+            key={t.id}
+            className={`side-item${settingsTab === t.id ? " active" : ""}`}
+            onClick={() => onSettingsTab(t.id)}
+          >
+            <Icon icon={t.icon} size="sm" /> {t.label}
+          </button>
+        ))}
+      </div>
+    </>
   );
 }
 

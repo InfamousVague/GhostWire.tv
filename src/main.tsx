@@ -2,6 +2,8 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { PlayerProvider } from "./ipc/player";
+import { DeviceProvider } from "./contexts/DeviceContext";
+import { SplashScreen } from "./components/SplashScreen";
 import { applyPlatformClasses, IS_TOUCH } from "./lib/platform";
 import { installLongPressContextMenu } from "./lib/longpress";
 
@@ -31,8 +33,11 @@ if (IS_TOUCH) installLongPressContextMenu();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <PlayerProvider>
-      <App />
-    </PlayerProvider>
+    <DeviceProvider>
+      <PlayerProvider>
+        <App />
+      </PlayerProvider>
+    </DeviceProvider>
+    <SplashScreen />
   </React.StrictMode>,
 );

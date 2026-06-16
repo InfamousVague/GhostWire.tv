@@ -1,6 +1,8 @@
 pub mod ai;
+pub mod anime;
 mod artwork;
 pub mod catalog;
+mod devices;
 pub mod discover;
 mod engine;
 pub mod enrich;
@@ -9,7 +11,10 @@ pub mod indexer;
 mod metadata;
 pub mod music;
 mod organize;
+pub mod playlist;
 pub mod posters;
+mod subtitles;
+mod remote;
 mod remux;
 mod spotify;
 pub mod tvmaze;
@@ -45,10 +50,10 @@ const SPOTIFLAC_OUTPUT_EVENT: &str = "spotiflac://output";
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct AppInfo {
-    download_dir: String,
-    data_dir: String,
-    ffmpeg_available: bool,
+pub(crate) struct AppInfo {
+    pub(crate) download_dir: String,
+    pub(crate) data_dir: String,
+    pub(crate) ffmpeg_available: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -109,6 +114,25 @@ async fn add_torrent(engine: tauri::State<'_, Engine>, magnet: String) -> Result
     engine.add(&magnet).await.map_err(|e| format!("{e:#}"))
 }
 
+/// PIN + LAN address to show on the host so a client can link to it.
+#[derive(serde::Serialize)]
+struct PairingInfo {
+    pin: String,
+    address: String,
+}
+
+/// Generate a fresh PIN for linking another device (the iPad) to this host over the LAN.
+/// The host UI shows the PIN + this Mac's address; the client enters them at `POST /api/pair`.
+#[tauri::command]
+async fn pairing_pin(engine: tauri::State<'_, Engine>) -> Result<PairingInfo, String> {
+    let pin = engine.offer_pairing_pin().await;
+    let ip = remote::local_ip().unwrap_or_else(|| "your-mac-ip".to_string());
+    Ok(PairingInfo {
+        pin,
+        address: format!("{ip}:{}", engine::STREAM_PORT),
+    })
+}
+
 #[tauri::command]
 async fn stream_url(
     engine: tauri::State<'_, Engine>,
@@ -141,6 +165,23 @@ async fn list_subtitles(
     rel: String,
 ) -> Result<Vec<engine::SubTrack>, String> {
     Ok(engine.list_subtitles(&rel).await)
+}
+
+/// Fetch a subtitle for a video that has none, free + keyless from OpenSubtitles. Saves it
+/// next to the file and returns the refreshed track list.
+#[tauri::command]
+async fn fetch_subtitles(
+    engine: tauri::State<'_, Engine>,
+    rel: String,
+    title: String,
+    season: Option<i64>,
+    episode: Option<i64>,
+    lang: Option<String>,
+) -> Result<Vec<engine::SubTrack>, String> {
+    engine
+        .fetch_subtitles(&rel, &title, season, episode, lang.as_deref().unwrap_or("eng"))
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -223,6 +264,15 @@ async fn test_source(
 async fn search_sources(
     catalog: tauri::State<'_, Catalog>,
     query: String,
+) -> Result<Vec<CatalogItem>, String> {
+    search_sources_core(catalog.inner(), &query).await
+}
+
+/// Callable core of `search_sources` (no `tauri::State`), so the LAN engine server can run
+/// the same live source search for a linked iPad in companion mode.
+pub(crate) async fn search_sources_core(
+    catalog: &Catalog,
+    query: &str,
 ) -> Result<Vec<CatalogItem>, String> {
     let q = query.trim().to_string();
     if q.is_empty() {
@@ -1202,6 +1252,15 @@ fn tidal_missing_bearer_hint(api_mode: &str) -> &'static str {
     }
 }
 
+fn spotify_clienttoken_unauthorized(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("clienttoken.spotify.com") && d.contains("401")
+}
+
+fn spotify_clienttoken_hint() -> &'static str {
+    "Hint: Spotify rejected SpotiFLAC's client-token request (401). This is upstream Spotify auth hardening and is not caused by Ghosty's local HTTP server/TLS. Update SpotiFLAC, retry later, or import via YouTube-link/search fallback."
+}
+
 fn tidal_bridge_quality(req: &TidalBridgeRequest) -> String {
     if req.endpoint.as_deref() == Some("manifests")
         || req
@@ -1908,6 +1967,9 @@ async fn music_spotiflac_download(
         if tidal_error_is_missing_bearer(&detail) {
             detail = format!("{}\n{}", detail, tidal_missing_bearer_hint(tidal_api_mode));
         }
+        if spotify_clienttoken_unauthorized(&detail) {
+            detail = format!("{}\n{}", detail, spotify_clienttoken_hint());
+        }
         return Err(format!("SpotiFLAC failed. {detail}"));
     }
     if completed_files == 0 {
@@ -1920,6 +1982,9 @@ async fn music_spotiflac_download(
         };
         if tidal_error_is_missing_bearer(&detail) {
             detail = format!("{}\n{}", detail, tidal_missing_bearer_hint(tidal_api_mode));
+        }
+        if spotify_clienttoken_unauthorized(&detail) {
+            detail = format!("{}\n{}", detail, spotify_clienttoken_hint());
         }
         return Err(format!(
             "SpotiFLAC finished but saved no new music files in {}. {}",
@@ -2122,6 +2187,24 @@ fn web_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A movie/show details digest (overview, IMDb/RT ratings, genres, runtime, cast,
+/// poster/backdrop, YouTube trailer key) fetched from the relay, which resolves it
+/// from TMDB/OMDb and caches it server-side — keyless and read-only.
+#[tauri::command]
+async fn movie_digest(kind: String, title: String, year: Option<i64>) -> Result<posters::MovieDigest, String> {
+    let client = web_client()?;
+    let clean = posters::clean_for_query(&title, &kind);
+    let yr = year.or_else(|| posters::year_from_title(&title));
+    posters::fetch_details(&client, &clean, yr, &kind).await.map_err(|e| format!("{e:#}"))
+}
+
+/// The curated featured carousel (movies/shows, each a full digest) from the relay.
+#[tauri::command]
+async fn featured() -> Result<Vec<posters::MovieDigest>, String> {
+    let client = web_client()?;
+    posters::fetch_featured(&client).await.map_err(|e| format!("{e:#}"))
+}
+
 /// Search TVMaze for shows matching `query` (the real series catalog).
 #[tauri::command]
 async fn tv_search(query: String) -> Result<Vec<tvmaze::TvShow>, String> {
@@ -2136,6 +2219,72 @@ async fn tv_search(query: String) -> Result<Vec<tvmaze::TvShow>, String> {
 #[tauri::command]
 async fn tv_episodes(show_id: i64) -> Result<Vec<tvmaze::TvEpisode>, String> {
     tvmaze::episodes(&web_client()?, show_id).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Lowercase + collapse to alphanumeric words — the join key shared with the frontend
+/// `norm()` so cached anime verdicts line up with the show titles the Anime tab sends.
+fn norm_title(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// TVMaze-backed anime classification for downloaded show titles, cached in settings so
+/// repeat calls are instant. Returns the subset of `titles` TVMaze tags with the **Anime**
+/// genre. This catches anime the local release-name heuristic can't — once a file is
+/// organized its fansub tag is stripped, and a show like "The Apothecary Diaries" carries
+/// no anime marker in its name; the genre lives only on TVMaze. Read-only, keyless.
+#[tauri::command]
+async fn classify_anime(
+    catalog: tauri::State<'_, Catalog>,
+    titles: Vec<String>,
+) -> Result<Vec<String>, String> {
+    use std::collections::HashMap;
+    // Persistent verdict cache: norm(title) -> is-anime. Only successful lookups are cached,
+    // so a transient TVMaze hiccup retries next time instead of sticking a false negative.
+    let mut cache: HashMap<String, bool> = catalog
+        .get_setting("anime_classify")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let client = web_client()?;
+    let mut out = Vec::new();
+    let mut dirty = false;
+    for t in &titles {
+        let key = norm_title(t);
+        if key.is_empty() {
+            continue;
+        }
+        let verdict = if let Some(&v) = cache.get(&key) {
+            v
+        } else {
+            match tvmaze::search_shows(&client, t).await {
+                Ok(shows) => {
+                    let best = shows.iter().find(|s| norm_title(&s.name) == key).or_else(|| shows.first());
+                    let v = best
+                        .map(|s| s.genres.iter().any(|g| g.eq_ignore_ascii_case("anime")))
+                        .unwrap_or(false);
+                    cache.insert(key.clone(), v);
+                    dirty = true;
+                    v
+                }
+                // Network/parse error — don't cache, so it's retried; treat as "not anime" now.
+                Err(_) => false,
+            }
+        };
+        if verdict {
+            out.push(t.clone());
+        }
+    }
+    if dirty {
+        if let Ok(j) = serde_json::to_string(&cache) {
+            let _ = catalog.set_setting("anime_classify", &j);
+        }
+    }
+    Ok(out)
 }
 
 // ---- Music discovery (keyless iTunes metadata) ----
@@ -2221,21 +2370,6 @@ fn list_library(catalog: tauri::State<'_, Catalog>) -> Result<Vec<catalog::Libra
 
 // ---- manual poster overrides (right-click → Replace poster) ----
 
-fn norm_title(s: &str) -> String {
-    let mut out = String::new();
-    let mut prev_space = false;
-    for c in s.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-            prev_space = false;
-        } else if !prev_space && !out.is_empty() {
-            out.push(' ');
-            prev_space = true;
-        }
-    }
-    out.trim().to_string()
-}
-
 /// Candidate poster URLs for a title (keyless IMDb + iTunes) — the picker grid.
 #[tauri::command]
 async fn poster_candidates(title: String, kind: Option<String>) -> Vec<String> {
@@ -2305,7 +2439,7 @@ fn list_poster_overrides(catalog: tauri::State<'_, Catalog>) -> Vec<PosterOverri
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct DownloadedItem {
+pub(crate) struct DownloadedItem {
     id: String,
     title: String,
     file_name: String,
@@ -2615,7 +2749,9 @@ fn cached_music_artwork_url(
 }
 
 /// The actual disk walk + parse (uncached). Kept separate so the command can cache it.
-fn scan_downloaded(info: &AppInfo, catalog: &Catalog) -> Vec<DownloadedItem> {
+/// `pub(crate)` so the LAN engine server (`engine.rs`) can serve the same Library scan
+/// to a linked iPad in companion mode.
+pub(crate) fn scan_downloaded(info: &AppInfo, catalog: &Catalog) -> Vec<DownloadedItem> {
     let root = std::path::PathBuf::from(&info.download_dir);
     let art_dir = std::path::PathBuf::from(&info.data_dir).join("artwork");
     std::fs::create_dir_all(&art_dir).ok();
@@ -2686,6 +2822,166 @@ fn list_downloaded(
     items
 }
 
+// ---- removable-device music sync (MP3 players / SD cards) ----
+
+/// Connected removable volumes the user could sync music onto. `folder_name` is the sync
+/// folder to report existing-track counts for (defaults to "Music"). The Library's own
+/// volume is excluded so you can't sync the source onto itself.
+#[tauri::command]
+async fn list_devices(
+    info: tauri::State<'_, AppInfo>,
+    folder_name: Option<String>,
+) -> Result<Vec<devices::Device>, String> {
+    let root = std::path::PathBuf::from(&info.download_dir);
+    let folder = folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Music")
+        .to_string();
+    tokio::task::spawn_blocking(move || devices::list(&root, &folder))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// If a device-relative path is already taken this sync, append " (2)" etc. so two tracks
+/// (e.g. two "Unknown Artist/Untitled.mp3") never clobber each other on the card.
+fn dedupe_rel(taken: &mut std::collections::BTreeSet<String>, rel: String) -> String {
+    if taken.insert(rel.clone()) {
+        return rel;
+    }
+    let (stem, ext) = rel.rsplit_once('.').unwrap_or((rel.as_str(), ""));
+    for n in 2..1000 {
+        let cand = if ext.is_empty() {
+            format!("{stem} ({n})")
+        } else {
+            format!("{stem} ({n}).{ext}")
+        };
+        if taken.insert(cand.clone()) {
+            return cand;
+        }
+    }
+    rel
+}
+
+/// Sync the Library's music onto a removable device into `<mount>/<folder_name>`, laid out
+/// as `Artist/Album/NN - Title.ext` from each file's tags. Copies only new/changed tracks
+/// (same-size files are skipped); when `mirror` is set, audio on the device that's no longer
+/// in the Library is deleted and emptied folders pruned (non-audio user files are never
+/// touched). When `playlists` is set, the app's playlists are also written into a `Playlists/`
+/// folder at the device root — as `.m3u8` files referencing the synced tracks (no duplication)
+/// or, in "folders" mode, as folders of copied tracks (for players that can't read .m3u).
+/// Streams a per-file `device-sync://progress` step to the UI.
+#[tauri::command]
+async fn sync_music_to_device(
+    app: tauri::AppHandle,
+    info: tauri::State<'_, AppInfo>,
+    catalog: tauri::State<'_, Catalog>,
+    mount_path: String,
+    folder_name: Option<String>,
+    mirror: Option<bool>,
+    playlists: Option<bool>,
+    playlist_mode: Option<String>,
+) -> Result<devices::SyncResult, String> {
+    use tauri::Emitter;
+    let mount = std::path::PathBuf::from(&mount_path);
+    if !mount.is_dir() {
+        return Err(format!("{mount_path} is not connected."));
+    }
+    let folder = folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Music")
+        .to_string();
+    let root = std::path::PathBuf::from(&info.download_dir);
+    let info = info.inner().clone();
+    let catalog = catalog.inner().clone();
+    let mirror = mirror.unwrap_or(false);
+    let do_playlists = playlists.unwrap_or(false);
+    let playlist_mode = playlist_mode.unwrap_or_else(|| "m3u8".to_string());
+    tokio::task::spawn_blocking(move || {
+        // The on-device layout comes from each track's tags (artist/album/title/track), so the
+        // card matches the desktop Library regardless of where the source file actually sits.
+        let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let files: Vec<devices::SyncFile> = scan_downloaded(&info, &catalog)
+            .into_iter()
+            .filter(|i| i.kind == "audio" && i.in_library)
+            .filter_map(|i| {
+                let src = root.join(&i.id);
+                if !src.is_file() {
+                    return None;
+                }
+                let ext = i.file_name.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_default();
+                let rel = devices::music_rel(i.artist.as_deref(), i.album.as_deref(), &i.title, i.track_no, &ext);
+                Some(devices::SyncFile {
+                    src,
+                    rel: dedupe_rel(&mut taken, rel),
+                    size: i.size_bytes.max(0) as u64,
+                })
+            })
+            .collect();
+
+        let dest_root = mount.join(&folder);
+        let app_music = app.clone();
+        let mut result = devices::sync(&files, &dest_root, mirror, move |step| {
+            let _ = app_music.emit("device-sync://progress", &step);
+        });
+
+        // Optionally write the app's playlists into <device>/Playlists/, mapping each
+        // playlist track to the synced copy on the card by its source path.
+        if do_playlists {
+            use std::collections::HashMap;
+            let by_src: HashMap<std::path::PathBuf, (String, u64)> =
+                files.iter().map(|f| (f.src.clone(), (f.rel.clone(), f.size))).collect();
+
+            let mut specs: Vec<devices::PlaylistSpec> = Vec::new();
+            for mut pl in playlist::list(&info.data_dir) {
+                // Make sure tracks point at their local files (paths aren't always persisted).
+                playlist::resolve_paths(&info.download_dir, &mut pl);
+                let entries: Vec<devices::PlaylistEntry> = pl
+                    .tracks
+                    .iter()
+                    .filter_map(|t| {
+                        let path = t.path.as_ref()?;
+                        // Only tracks that actually live on the device are included.
+                        let (rel, size) = by_src.get(&std::path::PathBuf::from(path))?;
+                        Some(devices::PlaylistEntry {
+                            src: std::path::PathBuf::from(path),
+                            device_rel: rel.clone(),
+                            title: t.title.clone(),
+                            artist: t.artist.clone(),
+                            duration_secs: (t.duration_ms / 1000).max(0),
+                            size: *size,
+                        })
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    specs.push(devices::PlaylistSpec { name: pl.name.clone(), entries });
+                }
+            }
+
+            let mode = devices::PlaylistMode::parse(&playlist_mode);
+            let app_pl = app.clone();
+            let pres = devices::sync_playlists(&specs, &mount, &folder, mode, move |step| {
+                let _ = app_pl.emit("device-sync://progress", &step);
+            });
+            result.playlists_written = pres.playlists_written;
+            result.playlist_tracks = pres.entries_written;
+            result.errors += pres.errors;
+            result.bytes_copied += pres.bytes_copied;
+            // Folder-mode playlist track copies are real file copies (emitted as "copied"
+            // steps), so fold them into the run's copied total — keeps the live tally and the
+            // final summary in agreement.
+            result.copied += pres.tracks_copied;
+        }
+
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// The model the AI tasks should use: the user's `ollama_model` override when it is
 /// actually installed, otherwise the best auto-pick. None when Ollama is offline.
 async fn resolve_model(catalog: &Catalog, client: &reqwest::Client) -> Option<String> {
@@ -2708,6 +3004,9 @@ async fn organize_run(
     info: tauri::State<'_, AppInfo>,
     catalog: tauri::State<'_, Catalog>,
     cache: tauri::State<'_, ScanCache>,
+    // Music is already nested into Artist/Album by SpotiFLAC, so the auto-cleanup pass
+    // passes false to leave it alone; a manual Organize defaults to including it.
+    include_music: Option<bool>,
 ) -> Result<organize::OrganizeResult, String> {
     use tauri::Emitter;
     let root = std::path::PathBuf::from(&info.download_dir);
@@ -2717,7 +3016,7 @@ async fn organize_run(
         .build()
         .map_err(|e| e.to_string())?;
     let model = resolve_model(catalog.inner(), &llm).await;
-    let res = organize::run(&root, &organized, &llm, model.as_deref(), move |step| {
+    let res = organize::run(&root, &organized, &llm, model.as_deref(), include_music.unwrap_or(true), move |step| {
         let _ = app.emit("organize://progress", &step);
     })
     .await;
@@ -2727,6 +3026,252 @@ async fn organize_run(
 
 fn organize_progress(phase: &str, done: usize, total: usize) -> serde_json::Value {
     serde_json::json!({ "phase": phase, "done": done, "total": total })
+}
+
+// ---- Library de-duplication (exact pass + AI-judged near-duplicate pass) ----
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DedupeDup {
+    id: String,
+    name: String,
+    album: String,
+    size_bytes: i64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DedupeGroup {
+    /// id (relpath) of the copy to keep.
+    keep: String,
+    keep_name: String,
+    keep_album: String,
+    keep_size: i64,
+    /// The redundant copies (proposed for the Trash).
+    duplicates: Vec<DedupeDup>,
+    reason: String,
+    /// "exact" (same artist+album+title) or "near" (AI-judged across releases).
+    kind: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DedupeResult {
+    root: String,
+    groups: Vec<DedupeGroup>,
+    removed: usize,
+    bytes_freed: i64,
+    errors: usize,
+    ai_used: bool,
+    model: Option<String>,
+}
+
+/// Punctuation/case-normalize, KEEPING bracketed qualifiers so "Song" and
+/// "Song (Live)" stay distinct for the exact pass.
+fn norm_exact(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Loose key for grouping near-duplicate CANDIDATES — drops bracketed qualifiers
+/// (Remaster/Live/feat…) so variants land together for the AI to adjudicate.
+fn norm_loose(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for c in lower.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = (depth - 1).max(0),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    if let Some(i) = out.find(" feat") {
+        out.truncate(i);
+    }
+    norm_exact(&out)
+}
+
+struct DTrack {
+    id: String,
+    artist: String,
+    album: String,
+    title: String,
+    size: i64,
+    added: i64,
+}
+
+/// Dry run: find duplicate music tracks. Exact duplicates (same artist+album+title,
+/// keeping the largest copy) are mechanical; near-duplicates across releases are
+/// judged by the local model when available. Read-only — nothing is removed until
+/// `dedupe_apply`. Streams `dedupe://progress`.
+#[tauri::command]
+async fn dedupe_plan(
+    app: tauri::AppHandle,
+    info: tauri::State<'_, AppInfo>,
+    catalog: tauri::State<'_, Catalog>,
+) -> Result<DedupeResult, String> {
+    use tauri::Emitter;
+    let root = std::path::PathBuf::from(&info.download_dir);
+    let tracks: Vec<DTrack> = scan_downloaded(info.inner(), catalog.inner())
+        .into_iter()
+        .filter(|i| i.kind == "audio" && i.in_library)
+        .map(|i| DTrack {
+            artist: i.artist.clone().unwrap_or_default(),
+            album: i.album.clone().unwrap_or_default(),
+            title: i.title.clone(),
+            id: i.id,
+            size: i.size_bytes,
+            added: i.added_at,
+        })
+        .collect();
+
+    let mut groups: Vec<DedupeGroup> = Vec::new();
+    let mut bytes_freed: i64 = 0;
+
+    let pick_keeper = |idxs: &[usize], t: &[DTrack]| -> usize {
+        *idxs.iter().max_by_key(|&&i| (t[i].size, -t[i].added)).unwrap()
+    };
+    let mut push_group = |idxs: &[usize], t: &[DTrack], reason: String, kind: &str, freed: &mut i64| -> usize {
+        let keep = pick_keeper(idxs, t);
+        let duplicates: Vec<DedupeDup> = idxs
+            .iter()
+            .filter(|&&i| i != keep)
+            .map(|&i| {
+                *freed += t[i].size;
+                DedupeDup { id: t[i].id.clone(), name: t[i].title.clone(), album: t[i].album.clone(), size_bytes: t[i].size }
+            })
+            .collect();
+        groups.push(DedupeGroup {
+            keep: t[keep].id.clone(),
+            keep_name: t[keep].title.clone(),
+            keep_album: t[keep].album.clone(),
+            keep_size: t[keep].size,
+            duplicates,
+            reason,
+            kind: kind.to_string(),
+        });
+        keep
+    };
+
+    // Exact pass: same artist | album | title (keep largest).
+    let mut exact: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (idx, t) in tracks.iter().enumerate() {
+        let key = format!("{}|{}|{}", norm_exact(&t.artist), norm_exact(&t.album), norm_exact(&t.title));
+        exact.entry(key).or_default().push(idx);
+    }
+    let mut survivors: Vec<usize> = Vec::new();
+    for idxs in exact.into_values() {
+        if idxs.len() <= 1 {
+            survivors.push(idxs[0]);
+            continue;
+        }
+        let keep = push_group(&idxs, &tracks, "Same track in the same album — keeping the largest copy.".to_string(), "exact", &mut bytes_freed);
+        survivors.push(keep);
+    }
+
+    // Near pass (AI): same artist | title across different releases.
+    let llm = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let model = resolve_model(catalog.inner(), &llm).await;
+    let mut ai_used = false;
+    if let Some(m) = model.as_deref() {
+        let mut near: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for &i in &survivors {
+            if tracks[i].title.trim().is_empty() {
+                continue; // untagged — nothing reliable to compare
+            }
+            let key = format!("{}|{}", norm_loose(&tracks[i].artist), norm_loose(&tracks[i].title));
+            near.entry(key).or_default().push(i);
+        }
+        let candidates: Vec<Vec<usize>> = near.into_values().filter(|v| v.len() > 1).collect();
+        let total = candidates.len();
+        for (gi, idxs) in candidates.into_iter().enumerate() {
+            let _ = app.emit("dedupe://progress", organize_progress("plan", gi + 1, total));
+            let mut ctx = String::new();
+            for (n, &i) in idxs.iter().enumerate() {
+                ctx.push_str(&format!(
+                    "[{}] artist={} | album={} | title={} | size={}MB\n",
+                    n, tracks[i].artist, tracks[i].album, tracks[i].title, tracks[i].size / 1_048_576
+                ));
+            }
+            ai_used = true;
+            match ai::dedupe_judge(&llm, m, &ctx).await {
+                Ok(v) if v.duplicate => {
+                    let reason = if v.reason.trim().is_empty() {
+                        "AI: same recording across releases.".to_string()
+                    } else {
+                        format!("AI: {}", v.reason.trim())
+                    };
+                    push_group(&idxs, &tracks, reason, "near", &mut bytes_freed);
+                }
+                _ => { /* distinct versions, or model error → keep both */ }
+            }
+        }
+    }
+
+    Ok(DedupeResult {
+        root: root.display().to_string(),
+        groups,
+        removed: 0,
+        bytes_freed,
+        errors: 0,
+        ai_used,
+        model,
+    })
+}
+
+/// Move the confirmed duplicate copies (by relpath) to the Trash. Recoverable from
+/// Finder; never touches keepers. Guards every path against the download root.
+#[tauri::command]
+async fn dedupe_apply(
+    app: tauri::AppHandle,
+    info: tauri::State<'_, AppInfo>,
+    cache: tauri::State<'_, ScanCache>,
+    paths: Vec<String>,
+) -> Result<DedupeResult, String> {
+    use tauri::Emitter;
+    let root = std::path::PathBuf::from(&info.download_dir)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let root_disp = root.display().to_string();
+    let total = paths.len();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut removed = 0usize;
+        let mut errors = 0usize;
+        let mut bytes_freed = 0i64;
+        for (i, rel) in paths.iter().enumerate() {
+            let _ = app.emit("dedupe://progress", organize_progress("apply", i + 1, total));
+            let abs = match root.join(rel).canonicalize() {
+                Ok(a) => a,
+                Err(_) => { errors += 1; continue; }
+            };
+            if !abs.starts_with(&root) {
+                errors += 1;
+                continue;
+            }
+            let sz = std::fs::metadata(&abs).map(|m| m.len() as i64).unwrap_or(0);
+            if trash_files(std::slice::from_ref(&abs)) == 1 {
+                removed += 1;
+                bytes_freed += sz;
+            } else {
+                errors += 1;
+            }
+        }
+        DedupeResult { root: root_disp, groups: Vec::new(), removed, bytes_freed, errors, ai_used: false, model: None }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    invalidate_scan(&cache); // files gone from disk
+    Ok(res)
 }
 
 // ---- AI metadata tagging (clean tags + legible names, embedded into files) ----
@@ -3350,6 +3895,154 @@ async fn export_items(
     Ok(results)
 }
 
+// ---- playlists (portable JSON manifests + format export/import) ----
+
+/// Fill each resolved track's `url` with the loopback stream URL the player uses for
+/// local files (same `/file/{relpath}` scheme as the Downloads list).
+fn fill_playlist_urls(download_dir: &str, p: &mut playlist::Playlist) {
+    let root = Path::new(download_dir);
+    for t in &mut p.tracks {
+        t.url = t.path.as_ref().and_then(|abs| {
+            Path::new(abs)
+                .strip_prefix(root)
+                .ok()
+                .map(|rel| format!("http://127.0.0.1:{}/file/{}", engine::STREAM_PORT, enc_path(&rel.to_string_lossy())))
+        });
+    }
+}
+
+
+/// All saved playlist manifests (newest first). File paths are re-resolved against the
+/// current library on each read so newly-downloaded songs light up automatically.
+#[tauri::command]
+fn list_playlists(info: tauri::State<'_, AppInfo>) -> Vec<playlist::Playlist> {
+    let mut all = playlist::list(&info.data_dir);
+    let dl = info.download_dir.clone();
+    for p in &mut all {
+        if playlist::resolve_paths(&dl, p) > 0 {
+            let _ = playlist::save(&info.data_dir, p);
+        }
+        fill_playlist_urls(&dl, p);
+    }
+    all
+}
+
+#[tauri::command]
+fn get_playlist(info: tauri::State<'_, AppInfo>, id: String) -> Result<playlist::Playlist, String> {
+    let mut p = playlist::load(&info.data_dir, &id)?;
+    if playlist::resolve_paths(&info.download_dir, &mut p) > 0 {
+        let _ = playlist::save(&info.data_dir, &p);
+    }
+    fill_playlist_urls(&info.download_dir, &mut p);
+    Ok(p)
+}
+
+#[tauri::command]
+fn create_playlist(
+    info: tauri::State<'_, AppInfo>,
+    name: String,
+    tracks: Option<Vec<playlist::PlaylistTrack>>,
+) -> Result<playlist::Playlist, String> {
+    let mut p = playlist::create(&info.data_dir, &name, "manual", now_ms(), tracks.unwrap_or_default())?;
+    playlist::resolve_paths(&info.download_dir, &mut p);
+    playlist::save(&info.data_dir, &p)?;
+    fill_playlist_urls(&info.download_dir, &mut p);
+    Ok(p)
+}
+
+#[tauri::command]
+fn delete_playlist(info: tauri::State<'_, AppInfo>, id: String) -> Result<(), String> {
+    playlist::delete(&info.data_dir, &id)
+}
+
+#[tauri::command]
+fn rename_playlist(info: tauri::State<'_, AppInfo>, id: String, name: String) -> Result<playlist::Playlist, String> {
+    let mut p = playlist::load(&info.data_dir, &id)?;
+    p.name = name.trim().to_string();
+    p.updated_at = now_ms();
+    playlist::save(&info.data_dir, &p)?;
+    Ok(p)
+}
+
+/// Append tracks to a playlist (used by "Save as playlist" / "Add to playlist").
+#[tauri::command]
+fn playlist_add_tracks(
+    info: tauri::State<'_, AppInfo>,
+    id: String,
+    tracks: Vec<playlist::PlaylistTrack>,
+) -> Result<playlist::Playlist, String> {
+    let mut p = playlist::load(&info.data_dir, &id)?;
+    p.tracks.extend(tracks);
+    p.updated_at = now_ms();
+    playlist::resolve_paths(&info.download_dir, &mut p);
+    playlist::save(&info.data_dir, &p)?;
+    fill_playlist_urls(&info.download_dir, &mut p);
+    Ok(p)
+}
+
+#[tauri::command]
+fn playlist_remove_track(info: tauri::State<'_, AppInfo>, id: String, index: usize) -> Result<playlist::Playlist, String> {
+    let mut p = playlist::load(&info.data_dir, &id)?;
+    if index < p.tracks.len() {
+        p.tracks.remove(index);
+        p.updated_at = now_ms();
+        playlist::save(&info.data_dir, &p)?;
+    }
+    fill_playlist_urls(&info.download_dir, &mut p);
+    Ok(p)
+}
+
+/// Export a playlist to `format` ("m3u8"|"m3u"|"pls"|"xspf") inside `dir`.
+/// Returns a human summary (written file + counts).
+#[tauri::command]
+fn export_playlist(
+    info: tauri::State<'_, AppInfo>,
+    id: String,
+    format: String,
+    dir: Option<String>,
+) -> Result<String, String> {
+    let mut p = playlist::load(&info.data_dir, &id)?;
+    playlist::resolve_paths(&info.download_dir, &mut p);
+    // Default to a Playlists/ folder under the music library when no dir is chosen.
+    let out = dir
+        .filter(|d| !d.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| music_output_dir(&info).join("Playlists"));
+    let (file, written, skipped) = playlist::export(&p, &format, &out)?;
+    let mut msg = format!("Exported {written} track{} to {file}", if written == 1 { "" } else { "s" });
+    if skipped > 0 {
+        msg.push_str(&format!(" ({skipped} not yet downloaded, skipped)"));
+    }
+    Ok(msg)
+}
+
+/// Import an M3U/M3U8/PLS/XSPF file as a new playlist manifest.
+#[tauri::command]
+fn import_playlist(info: tauri::State<'_, AppInfo>, file_path: String) -> Result<playlist::Playlist, String> {
+    let mut p = playlist::import(&file_path, now_ms())?;
+    playlist::resolve_paths(&info.download_dir, &mut p);
+    playlist::save(&info.data_dir, &p)?;
+    fill_playlist_urls(&info.download_dir, &mut p);
+    Ok(p)
+}
+
+/// Link a Spotify playlist → save a real manifest of its songs (matched to local
+/// files where downloaded). The companion to `spotify_replicate`, which finds the
+/// torrents; this captures *which* songs belong together so they can be exported.
+#[tauri::command]
+async fn spotify_to_playlist(
+    catalog: tauri::State<'_, Catalog>,
+    info: tauri::State<'_, AppInfo>,
+    link: String,
+) -> Result<playlist::Playlist, String> {
+    let (name, tracks) = spotify::fetch_playlist_for(&catalog, &link).await?;
+    let mut p = playlist::create(&info.data_dir, &name, "spotify", now_ms(), tracks)?;
+    playlist::resolve_paths(&info.download_dir, &mut p);
+    playlist::save(&info.data_dir, &p)?;
+    fill_playlist_urls(&info.download_dir, &mut p);
+    Ok(p)
+}
+
 // ---- TV discovery + AI season compilation ----
 
 /// Popular/trending TV shows merged from TMDB, Trakt and IMDb (whichever are
@@ -3365,6 +4058,30 @@ async fn popular_shows(catalog: tauri::State<'_, Catalog>) -> Result<Vec<discove
         .build()
         .map_err(|e| e.to_string())?;
     Ok(discover::popular_shows(&client, tmdb.as_deref(), trakt.as_deref(), omdb.as_deref()).await)
+}
+
+/// Popular/trending/seasonal anime from free keyless APIs (AniList + MyAnimeList via
+/// Jikan). Powers the Anime discovery rails. No key required.
+#[tauri::command]
+async fn popular_anime() -> Result<anime::AnimeDiscovery, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(anime::popular_anime(&client).await)
+}
+
+/// Look up one anime by title (synopsis, genres, episode count + episode list) for the
+/// below-player anime panel. Keyless (AniList → Jikan). Null when nothing matches.
+#[tauri::command]
+async fn anime_detail(title: String) -> Result<Option<anime::AnimeDetail>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(anime::anime_detail(&client, title.trim()).await)
 }
 
 /// For a chosen show, search every linked source and bucket the magnets by season
@@ -3424,6 +4141,11 @@ pub fn run() {
             }
             // A user-chosen storage folder (Settings) overrides the default download dir.
             let stored_dir = catalog.get_setting("storage_dir").filter(|s| !s.trim().is_empty());
+            // Stable identity + HMAC secret for LAN device-linking (generated on first run).
+            let device_identity = remote::ensure_device_identity(&catalog);
+            // Hand a cheap clone (shared Arc<Mutex> connection) to the engine so the LAN API
+            // can serve this desktop's catalog/Library to a linked iPad in companion mode.
+            let engine_catalog = catalog.clone();
             app.manage(catalog);
             let scan_cache = ScanCache(Arc::new(Mutex::new(None)));
             app.manage(scan_cache.clone());
@@ -3458,17 +4180,23 @@ pub fn run() {
             let art_dir = data_dir.join("artwork");
             std::fs::create_dir_all(&art_dir).ok();
             let (ffmpeg, ffprobe) = engine::resolve_ffmpeg();
-            app.manage(AppInfo {
+            let app_info = AppInfo {
                 download_dir: download_dir.display().to_string(),
                 data_dir: data_dir.display().to_string(),
                 ffmpeg_available: ffmpeg.is_some(),
-            });
+            };
+            // Clone for the engine (companion mode) before app.manage moves the original.
+            let engine_app_info = app_info.clone();
+            app.manage(app_info);
             let engine = tauri::async_runtime::block_on(Engine::start(
                 app.handle().clone(),
                 download_dir,
                 art_dir,
                 ffmpeg,
                 ffprobe,
+                device_identity,
+                engine_catalog,
+                engine_app_info,
             ))
             .map_err(|e| Box::<dyn std::error::Error>::from(format!("{e:#}")))?;
             app.manage(engine);
@@ -3476,11 +4204,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             add_torrent,
+            pairing_pin,
             stream_url,
             torrent_stats,
             list_downloads,
             media_info,
             list_subtitles,
+            fetch_subtitles,
             remove_torrent,
             list_sources,
             add_source,
@@ -3499,6 +4229,8 @@ pub fn run() {
             tidal_authorize_login,
             app_info,
             relay_status,
+            movie_digest,
+            featured,
             vpn_status,
             music_spotiflac_status,
             music_spotiflac_install,
@@ -3508,6 +4240,7 @@ pub fn run() {
             tv_search,
             tv_episodes,
             tv_trailer,
+            classify_anime,
             music_search_artists,
             music_artist_albums,
             music_album_tracks,
@@ -3517,9 +4250,13 @@ pub fn run() {
             organize_run,
             tag_plan,
             tag_apply,
+            dedupe_plan,
+            dedupe_apply,
             convert_audio,
             list_library,
             list_downloaded,
+            list_devices,
+            sync_music_to_device,
             poster_candidates,
             set_poster,
             list_poster_overrides,
@@ -3539,7 +4276,19 @@ pub fn run() {
             list_exportable,
             export_items,
             popular_shows,
+            popular_anime,
+            anime_detail,
             compile_seasons,
+            list_playlists,
+            get_playlist,
+            create_playlist,
+            delete_playlist,
+            rename_playlist,
+            playlist_add_tracks,
+            playlist_remove_track,
+            export_playlist,
+            import_playlist,
+            spotify_to_playlist,
             spotify::spotify_status,
             spotify::spotify_login,
             spotify::spotify_logout,
@@ -3560,6 +4309,9 @@ fn seed_default_sources(catalog: &Catalog) {
         ("WebTorrent (free media)", "scraper", "https://webtorrent.io/free-torrents"),
         ("Academic Torrents", "scraper", "https://academictorrents.com/browse.php?cat=6"),
         ("Linux Tracker", "scraper", "https://linuxtracker.org/index.php?page=torrents&active=1"),
+        // Anime: SubsPlease's keyless JSON API + Nyaa's RSS (handled by adapters in indexer.rs).
+        ("SubsPlease (anime)", "scraper", "https://subsplease.org"),
+        ("Nyaa (anime + more)", "scraper", "https://nyaa.si"),
     ];
     for (name, kind, url) in defaults {
         let _ = catalog.add_source(name, kind, url);

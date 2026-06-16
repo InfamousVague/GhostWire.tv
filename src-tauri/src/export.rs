@@ -16,6 +16,66 @@ pub const AUDIO_EXT: &[&str] = &[
 ];
 /// Containers Apple Music imports directly; anything else is transcoded to ALAC.
 const APPLE_MUSIC_OK: &[&str] = &["mp3", "m4a", "aac", "wav", "aiff", "aif", "alac"];
+pub const SUBTITLE_EXT: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx"];
+
+/// Sidecar subtitles that belong to `video`, as `(source_path, dest_suffix)` pairs —
+/// `dest_suffix` is appended to the destination video's stem so they keep its name and
+/// the player's stem-match lookup finds them. Covers: same-folder files that share the
+/// video's stem (`Movie.mkv` + `Movie.en.srt`), any subtitle in a lone-video folder, and
+/// a sibling `Subs/`/`Subtitles/` folder (the common scene-release layout). This is how
+/// caption files travel WITH the video when it's organized or exported.
+pub(crate) fn related_subtitles(video: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let Some(dir) = video.parent() else { return out };
+    let Some(stem) = video.file_stem().and_then(|s| s.to_str()) else { return out };
+    let is_sub = |p: &Path| SUBTITLE_EXT.contains(&ext_of(p).as_str());
+
+    // Lone video → adopt subs that don't share the name (e.g. "English.srt").
+    let lone = std::fs::read_dir(dir)
+        .map(|es| es.flatten().filter(|e| VIDEO_EXT.contains(&ext_of(&e.path()).as_str())).count() <= 1)
+        .unwrap_or(false);
+
+    // Same folder.
+    if let Ok(es) = std::fs::read_dir(dir) {
+        for e in es.flatten() {
+            let p = e.path();
+            if !p.is_file() || !is_sub(&p) {
+                continue;
+            }
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(suffix) = name.strip_prefix(stem) {
+                out.push((p.clone(), suffix.to_string()));
+            } else if lone {
+                out.push((p.clone(), format!(".{name}")));
+            }
+        }
+    }
+
+    // Sibling Subs/ (or Subtitles/) folder.
+    if let Ok(es) = std::fs::read_dir(dir) {
+        for e in es.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let dn = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !matches!(dn.as_str(), "subs" | "subtitles" | "sub") {
+                continue;
+            }
+            if let Ok(subs) = std::fs::read_dir(&p) {
+                for se in subs.flatten() {
+                    let sp = se.path();
+                    if !sp.is_file() || !is_sub(&sp) {
+                        continue;
+                    }
+                    let sname = sp.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    out.push((sp.clone(), format!(".{sname}")));
+                }
+            }
+        }
+    }
+    out
+}
 
 /// One media file found under the download folder, with parsed naming + a preview
 /// of where it would land in an organized library.
@@ -279,13 +339,29 @@ pub fn export_to_library(src: &Path, root: &Path) -> ExportResult {
     let parsed = parse_name(stem);
     let dest = root.join(rel_path(&parsed, kind, &ext));
     match copy_into(src, &dest) {
-        Ok(()) => ExportResult {
-            path: src.display().to_string(),
-            ok: true,
-            dest: Some(dest.display().to_string()),
-            converted: false,
-            message: format!("Copied to {}", dest.display()),
-        },
+        Ok(()) => {
+            // Bring any sidecar caption files along, renamed next to the exported video so
+            // Plex (and our own player) pick them up.
+            if kind == "video" {
+                if let (Some(to_dir), Some(to_stem)) =
+                    (dest.parent(), dest.file_stem().and_then(|s| s.to_str()))
+                {
+                    for (sub_src, suffix) in related_subtitles(src) {
+                        let sub_dest = to_dir.join(format!("{to_stem}{suffix}"));
+                        if !sub_dest.exists() {
+                            let _ = copy_into(&sub_src, &sub_dest);
+                        }
+                    }
+                }
+            }
+            ExportResult {
+                path: src.display().to_string(),
+                ok: true,
+                dest: Some(dest.display().to_string()),
+                converted: false,
+                message: format!("Copied to {}", dest.display()),
+            }
+        }
         Err(e) => ExportResult {
             path: src.display().to_string(),
             ok: false,

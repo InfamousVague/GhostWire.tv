@@ -11,11 +11,14 @@ import { TvShows } from "./views/TvShows";
 import { Music } from "./views/Music";
 import { Movies } from "./views/Movies";
 import { Anime } from "./views/Anime";
+import { Digest } from "./views/Digest";
 import { Library } from "./views/Library";
 import { LibraryProvider } from "./ipc/libraryCache";
 import { ReplacePoster } from "./components/ReplacePoster";
 import { Export } from "./views/Export";
 import { Automation } from "./views/Automation";
+import { Playlists } from "./views/Playlists";
+import { Sync } from "./views/Sync";
 import { SpotifyReplicate } from "./components/SpotifyReplicate";
 import { NowPlayingBar } from "./components/NowPlayingBar";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -23,9 +26,13 @@ import { usePlayer, type PlayerTrack } from "./ipc/player";
 import { OrganizePanel, type OrganizePhase } from "./components/OrganizePanel";
 import { organizeRun, onOrganizeProgress, type OrganizeResult, type OrganizeStep } from "./ipc/organize";
 import { MOCK_CATALOG, MOCK_SOURCES } from "./lib/catalog";
-import { mediaKind, sectionOf, genresOf, type MediaSectionId, type SectionSort } from "./lib/media";
+import { isAnime, mediaKind, sectionOf, genresOf, type MediaKind, type MediaSectionId, type SectionSort } from "./lib/media";
+import type { SettingsTab } from "./lib/settingsTabs";
 import type { CatalogItem, DownloadStats, MediaInfo, Source, SourceKind } from "./lib/types";
 import { IN_TAURI, addTorrent, getStreamUrl, mediaInfo, onDownloads, pauseDownload, removeTorrent, revealDownload } from "./ipc/engine";
+import { remoteAddTorrent, remoteListDownloads, remoteStreamUrl } from "./ipc/remote";
+import { useLinkedDevice } from "./contexts/DeviceContext";
+import { IS_IOS } from "./lib/platform";
 import {
   addSource,
   aiScan,
@@ -43,10 +50,13 @@ import {
   openBrowser,
   refreshSource,
   removeSource,
+  resolveLocalPlayUrl,
   searchSources,
+  featured as fetchFeatured,
   type AiStatus,
   type DownloadedItem,
   type LibraryItem,
+  type MovieDigest,
 } from "./ipc/library";
 
 type AppView = NavId | "player";
@@ -113,15 +123,36 @@ function mockStats(id: string, title: string): DownloadStats {
   };
 }
 
+// Keyless relay poster by title (+ kind). It's plain https, so it loads anywhere — no
+// local /art cache or LAN image fetch — which is why it's the reliable fallback on the
+// iPad companion, where downloaded titles often aren't in the catalog/library lookup.
+const POSTER_RELAY = "https://theblackpearl.tv/api/poster";
+function relayPosterUrl(title: string, kind?: string): string | undefined {
+  const clean = title.trim();
+  if (!clean) return undefined;
+  const t = (kind ?? "").toLowerCase();
+  if (t === "music") return undefined; // album art is resolved separately (iTunes/embedded)
+  const type = t === "anime" ? "anime" : t === "show" || t === "tv" || t === "series" ? "tv" : "movie";
+  return `${POSTER_RELAY}?type=${type}&title=${encodeURIComponent(clean)}`;
+}
+
 export default function App() {
   const [view, setView] = useState<AppView>("discover");
   const [prevView, setPrevView] = useState<NavId>("discover");
   const player = usePlayer();
+  const { linkedMac } = useLinkedDevice();
+  // Companion mode: on iOS, the app is a pure mirror of a linked desktop — it shows the
+  // desktop's downloads and streams them, but never downloads or stores anything locally.
+  const companionMode = IS_IOS && !!linkedMac;
+  const [remoteDownloads, setRemoteDownloads] = useState<DownloadStats[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<CatalogItem[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [recents, setRecents] = useState<string[]>(loadRecents);
+  // Featured carousel (from the relay) + the movie/show details digest shown on click.
+  const [featuredItems, setFeaturedItems] = useState<MovieDigest[]>([]);
+  const [digestItem, setDigestItem] = useState<CatalogItem | null>(null);
 
   // Spotify playlist replicator — lifted to App so it opens from the Music tab AND
   // from a Spotify link pasted into the main search.
@@ -159,7 +190,9 @@ export default function App() {
     setOrgResult(null);
     setOrgError(null);
     try {
-      const r = await organizeRun();
+      // The auto-cleanup pass (silent) leaves music alone — SpotiFLAC already nests it
+      // by Artist/Album. A manual Organize still includes music.
+      const r = await organizeRun(!opts?.silent);
       setOrgResult(r);
       setOrgPhase("done");
       refreshLibrary();
@@ -181,10 +214,20 @@ export default function App() {
     return () => un?.();
   }, []);
 
+  // Load the relay's curated featured carousel once (best-effort; Discover falls back
+  // to the local pool when the relay has none).
+  useEffect(() => {
+    if (!IN_TAURI) return;
+    fetchFeatured().then(setFeaturedItems).catch(() => {});
+  }, []);
+
   // --- shell chrome (Libre-style nav rail + collapsible contextual sidebar) ---
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [secSort, setSecSort] = useState<SectionSort>("popularity");
   const [secGenre, setSecGenre] = useState<string | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  // Sub-tab within the Music section (the iTunes browse vs. Playlists).
+  const [musicTab, setMusicTab] = useState<"browse" | "playlists" | "sync">("browse");
 
   function pushRecent(q: string) {
     setRecents((cur) => {
@@ -411,13 +454,16 @@ export default function App() {
     for (const [k, url] of Object.entries(overrides)) m.set(k, url); // overrides win
     return m;
   }, [dbItems, libraryItems, overrides]);
-  function posterForTitle(title: string): string | undefined {
+  function posterForTitle(title: string, kind?: string): string | undefined {
     const k = title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
     if (!k) return undefined;
     const exact = posterByTitle.get(k);
     if (exact) return exact;
     for (const [key, url] of posterByTitle) if (key.startsWith(k) || k.startsWith(key)) return url;
-    return undefined;
+    // Reliable https fallback: resolve from the keyless relay by title (+ kind). Works
+    // anywhere — no local /art cache or LAN image load needed (key for the iPad companion,
+    // where downloaded titles often aren't in the catalog/library lookup at all).
+    return relayPosterUrl(title, kind);
   }
 
   // Overlay AI metadata (mediaType / ratings / poster) from the scanned library onto
@@ -549,91 +595,202 @@ export default function App() {
     setView("player");
   }
 
+  /** On iOS the app is a pure companion — it never downloads or stores locally. A download
+   *  always goes to the linked desktop; with nothing linked there's nowhere to send it.
+   *  On desktop, always local. */
+  function chooseDownloadTarget(_title: string): Promise<"mac" | "local" | null> {
+    if (IS_IOS) return Promise.resolve(linkedMac ? "mac" : null);
+    return Promise.resolve("local");
+  }
+
+  /** Open + stream a download that lives on the linked desktop (companion mode). */
+  async function openRemoteDownload(id: string) {
+    if (!linkedMac) return;
+    const d = remoteDownloads.find((x) => x.id === id);
+    const title = d?.title ?? "Streaming";
+    setStreamItems((s) => ({ ...s, [id]: { title, source: linkedMac.name, kind: "video" } }));
+    openPlayer(id);
+    try {
+      const url = await remoteStreamUrl(linkedMac, id);
+      setStreamItems((s) => ({ ...s, [id]: { ...(s[id] ?? { title }), url } }));
+    } catch (e) {
+      console.error("remote stream failed", e);
+    }
+  }
+
+  // Mirror the linked desktop's active downloads (companion mode), polling ~2s.
+  useEffect(() => {
+    if (!companionMode || !linkedMac) {
+      setRemoteDownloads([]);
+      return;
+    }
+    let alive = true;
+    const poll = async () => {
+      try {
+        const list = (await remoteListDownloads(linkedMac)) as DownloadStats[];
+        if (alive) setRemoteDownloads(list);
+      } catch {
+        /* desktop unreachable — keep the last list */
+      }
+    };
+    void poll();
+    const t = window.setInterval(poll, 2000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [companionMode, linkedMac]);
+
   async function startStream(item: CatalogItem) {
     const kind = mediaKind(item.title, item.category);
     // Software, disk images, books, archives… are files, not media — download
     // them, never open the player or the encoder.
     if (kind === "other") {
-      startFileDownload(item);
+      void startFileDownload(item);
       return;
     }
+    // Movies & shows open a details digest (trailer + IMDb + cast) first, instead of
+    // downloading/streaming immediately. Music & uncategorized video stream directly.
+    const section = sectionOf(item);
+    if (section === "movies" || section === "tvshows") {
+      setDigestItem(item);
+      return;
+    }
+    void streamNow(item, kind);
+  }
+
+  // The actual stream path (preview mark → player → engine). Called directly for
+  // music and from the digest's Stream button for movies/shows.
+  async function streamNow(item: CatalogItem, kind: MediaKind) {
     // Streaming = ephemeral preview unless the user later downloads it explicitly.
     previews.current.add(item.id);
     setStreamItems((s) => ({
       ...s,
-      [item.id]: { title: item.title, sizeBytes: item.sizeBytes, source: item.source, kind, poster: item.poster },
+      [item.id]: { title: item.title, sizeBytes: item.sizeBytes, source: item.source, kind: kind === "audio" ? "audio" : "video", poster: item.poster },
     }));
     openPlayer(item.id);
     if (!IN_TAURI) {
       setDownloads((d) => upsert(d, mockStats(item.id, item.title)));
       return;
     }
+    const target = await chooseDownloadTarget(item.title);
+    if (target === null) return; // cancelled
     try {
-      await addTorrent(item.magnet);
-      const url = await getStreamUrl(item.id);
-      setDownloads((d) => upsert(d, { ...baseStats(item.id, item.title), streamUrl: url }));
+      if (target === "mac" && linkedMac) {
+        // Add + transcode on the Mac, stream the result back (plays any codec).
+        await remoteAddTorrent(linkedMac, item.magnet);
+        const url = await remoteStreamUrl(linkedMac, item.id);
+        setDownloads((d) => upsert(d, { ...baseStats(item.id, item.title), streamUrl: url }));
+      } else {
+        await addTorrent(item.magnet);
+        const url = await getStreamUrl(item.id);
+        setDownloads((d) => upsert(d, { ...baseStats(item.id, item.title), streamUrl: url }));
+      }
     } catch (e) {
       console.error("startStream failed", e);
     }
   }
 
   /** Non-media item: queue the download and show it in Downloads — no player, no ffmpeg. */
-  function startFileDownload(item: CatalogItem) {
+  async function startFileDownload(item: CatalogItem) {
     previews.current.delete(item.id); // an explicit download is kept, not a preview
-    setDownloads((d) => upsert(d, IN_TAURI ? baseStats(item.id, item.title) : mockStats(item.id, item.title)));
     setView("downloads");
-    if (IN_TAURI) addTorrent(item.magnet).catch((e) => console.error("download failed", e));
+    if (!IN_TAURI) {
+      setDownloads((d) => upsert(d, mockStats(item.id, item.title)));
+      return;
+    }
+    const target = await chooseDownloadTarget(item.title);
+    if (target === null) return;
+    setDownloads((d) => upsert(d, baseStats(item.id, item.title)));
+    try {
+      if (target === "mac" && linkedMac) await remoteAddTorrent(linkedMac, item.magnet);
+      else await addTorrent(item.magnet);
+    } catch (e) {
+      console.error("download failed", e);
+    }
   }
 
   /** Queue a torrent for download WITHOUT opening the player — used by the series
    *  finder's "Add to library" so grabbing a season pack never streams episode 1.
    *  Stays on the current view; the download surfaces in Downloads (and the Library
    *  once it finishes). */
-  function downloadToLibrary(item: CatalogItem) {
+  async function downloadToLibrary(item: CatalogItem) {
     previews.current.delete(item.id); // explicit download — keep it
-    setDownloads((d) => upsert(d, IN_TAURI ? baseStats(item.id, item.title) : mockStats(item.id, item.title)));
-    if (IN_TAURI) addTorrent(item.magnet).catch((e) => console.error("download failed", e));
+    if (!IN_TAURI) {
+      setDownloads((d) => upsert(d, mockStats(item.id, item.title)));
+      return;
+    }
+    const target = await chooseDownloadTarget(item.title);
+    if (target === null) return;
+    setDownloads((d) => upsert(d, baseStats(item.id, item.title)));
+    try {
+      if (target === "mac" && linkedMac) await remoteAddTorrent(linkedMac, item.magnet);
+      else await addTorrent(item.magnet);
+    } catch (e) {
+      console.error("download failed", e);
+    }
   }
 
-  /** Play a file already downloaded to disk (Library) — streamed from the loopback /file route. */
-  function playLocal(item: DownloadedItem) {
+  /** Play a file already downloaded to disk (Library) — streamed from the loopback /file route.
+   *  In companion mode (iPad linked to a desktop) the URL resolves to a token-bearing stream on
+   *  the desktop instead, so playback comes off the desktop and the iPad only buffers. */
+  async function playLocal(item: DownloadedItem) {
     // Audio plays in the global player (persistent now-playing bar + visualizer),
     // not the full-screen video player. Build a library-wide queue so next/prev work.
     if (item.kind === "audio") {
       void playAudio(item);
       return;
     }
+    const url = await resolveLocalPlayUrl(item).catch(() => item.url);
     const id = `local:${item.id}`;
     setStreamItems((s) => ({
       ...s,
-      [id]: { title: item.title, kind: item.kind, poster: posterForTitle(item.title), url: item.url, relpath: item.id },
+      [id]: {
+        title: item.title,
+        kind: item.kind,
+        poster: posterForTitle(item.title),
+        url,
+        relpath: item.id,
+        // Carry the parsed episode context so the below-player show panel works for local
+        // files (whose clean title no longer contains S/E like a release name does).
+        show: item.title,
+        season: item.season,
+        episode: item.episode,
+        isAnime: isAnime({ title: item.title, genre: item.genre }),
+      },
     }));
     setDownloads((d) =>
-      upsert(d, { id, title: item.title, state: "ready", progress: 1, downSpeed: 0, upSpeed: 0, peers: 0, streamUrl: item.url }),
+      upsert(d, { id, title: item.title, state: "ready", progress: 1, downSpeed: 0, upSpeed: 0, peers: 0, streamUrl: url }),
     );
     openPlayer(id);
   }
 
-  /** Play a local audio file through the global player, queueing the whole music library. */
+  /** Play a local audio file through the global player, queueing the whole music library.
+   *  In companion mode each track's URL resolves to a token-bearing stream on the linked
+   *  desktop (resolved by relpath), so the iPad buffers audio off the desktop. */
   async function playAudio(item: DownloadedItem) {
-    const toTrack = (it: DownloadedItem): PlayerTrack => ({
+    const toTrack = async (it: DownloadedItem): Promise<PlayerTrack> => ({
       id: it.id,
       title: it.title,
-      url: it.url,
-      art: posterForTitle(it.title),
+      artist: it.artist ?? undefined,
+      album: it.album ?? undefined,
+      url: await resolveLocalPlayUrl(it).catch(() => it.url),
+      // Embedded album art (served from loopback /art) first, then any matched poster.
+      art: it.artworkUrl ?? posterForTitle(it.title) ?? undefined,
     });
     if (!IN_TAURI) {
-      player.play([toTrack(item)], 0);
+      player.play([await toTrack(item)], 0);
       return;
     }
     try {
       const all = await listDownloaded();
       const music = all.filter((i) => i.mediaType === "music").sort((a, b) => a.id.localeCompare(b.id));
-      const queue = (music.length ? music : [item]).map(toTrack);
+      const list = music.length ? music : [item];
+      const queue = await Promise.all(list.map(toTrack));
       const idx = Math.max(0, queue.findIndex((t) => t.id === item.id));
       player.play(queue, idx);
     } catch {
-      player.play([toTrack(item)], 0);
+      player.play([await toTrack(item)], 0);
     }
   }
 
@@ -655,7 +812,7 @@ export default function App() {
           d.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() === w,
       );
       if (local) {
-        playLocal(local);
+        await playLocal(local);
         return true;
       }
     } catch {
@@ -678,6 +835,45 @@ export default function App() {
     return false;
   }
 
+  /** Play an anime episode by absolute number — local copy first, else a source search. */
+  async function playAnimeEpisode(title: string, episode: number): Promise<boolean> {
+    if (!IN_TAURI) return false;
+    const w = title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const firstWord = w.split(" ")[0] ?? "";
+    try {
+      const have = await listDownloaded();
+      const local = have.find(
+        (d) =>
+          d.kind === "video" &&
+          d.episode === episode &&
+          isAnime({ title: d.title, genre: d.genre }) &&
+          d.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().includes(firstWord),
+      );
+      if (local) {
+        await playLocal(local);
+        return true;
+      }
+    } catch {
+      /* fall through to a source search */
+    }
+    try {
+      const epNum = String(episode);
+      const hits = await searchSources(`${title} ${epNum.padStart(2, "0")}`);
+      // Prefer a single-episode file whose title carries the absolute number as its own
+      // token (strip resolutions first so "1080p" can't masquerade as the episode).
+      const re = new RegExp(`(^|[^0-9])0*${epNum}([^0-9]|$)`);
+      const single = hits.find((h) => re.test(h.title.replace(/\b\d{3,4}p\b/gi, " ")));
+      const pick = single ?? hits[0];
+      if (pick) {
+        void startStream(pick);
+        return true;
+      }
+    } catch (e) {
+      console.error("playAnimeEpisode failed", e);
+    }
+    return false;
+  }
+
   async function addMagnet(magnet: string) {
     if (!IN_TAURI) {
       const id = `paste-${magnet.slice(20, 32)}`;
@@ -686,12 +882,22 @@ export default function App() {
       openPlayer(id);
       return;
     }
+    const target = await chooseDownloadTarget("Pasted magnet");
+    if (target === null) return;
     try {
-      const id = await addTorrent(magnet);
-      setStreamItems((s) => ({ ...s, [id]: { title: "Pasted magnet", source: "magnet link" } }));
-      openPlayer(id);
-      const url = await getStreamUrl(id);
-      setDownloads((d) => upsert(d, { ...baseStats(id, "Pasted magnet"), streamUrl: url }));
+      if (target === "mac" && linkedMac) {
+        const id = await remoteAddTorrent(linkedMac, magnet);
+        setStreamItems((s) => ({ ...s, [id]: { title: "Pasted magnet", source: "magnet link" } }));
+        openPlayer(id);
+        const url = await remoteStreamUrl(linkedMac, id);
+        setDownloads((d) => upsert(d, { ...baseStats(id, "Pasted magnet"), streamUrl: url }));
+      } else {
+        const id = await addTorrent(magnet);
+        setStreamItems((s) => ({ ...s, [id]: { title: "Pasted magnet", source: "magnet link" } }));
+        openPlayer(id);
+        const url = await getStreamUrl(id);
+        setDownloads((d) => upsert(d, { ...baseStats(id, "Pasted magnet"), streamUrl: url }));
+      }
     } catch (e) {
       console.error("addMagnet failed", e);
     }
@@ -820,6 +1026,18 @@ export default function App() {
   const activeItem = activeId ? streamItems[activeId] : undefined;
   // Which rail item is highlighted (player overlays its originating section).
   const activeNav: NavId = view === "player" ? prevView : (view as NavId);
+  // Music has its own in-view browse + filter surfaces, so hide the shell sidebar
+  // for both Music sub-tabs (Browse and Playlists).
+  const musicSectionActive = activeNav === "music";
+  // The shell's contextual sidebar is hidden for sections that drive their own in-view
+  // navigation (Library/Anime/Playlists/Music). Settings keeps it — its General/Storage/
+  // Media… sub-nav lives in the sidebar card, the same as the other sections' filters.
+  const hideSidebar =
+    sidebarCollapsed ||
+    activeNav === "library" ||
+    activeNav === "anime" ||
+    activeNav === "playlists" ||
+    musicSectionActive;
   // The content section to render (null while the player is open or on a non-section view).
   const activeSection = (MEDIA_SECTIONS as string[]).includes(view) ? (view as MediaSectionId) : null;
   // The section whose filters the sidebar shows (sticks to the origin section in the player).
@@ -849,7 +1067,7 @@ export default function App() {
         organize={orgPhase === "idle" ? null : { phase: orgPhase, done: orgProgress.done, total: orgProgress.total, moved: orgResult?.moved ?? 0, changes: orgProgress.total }}
         onOrganizeClick={() => setOrgOpen((v) => !v)}
       />
-      <div className={`app-body${sidebarCollapsed || activeNav === "library" || activeNav === "anime" ? " sidebar-collapsed" : ""}`}>
+      <div className={`app-body${hideSidebar ? " sidebar-collapsed" : ""}`}>
         <NavigationRail
           active={activeNav}
           onNavigate={navigate}
@@ -857,7 +1075,7 @@ export default function App() {
           sourceCount={sources.length}
         />
         <Sidebar
-          collapsed={sidebarCollapsed || activeNav === "library" || activeNav === "anime"}
+          collapsed={hideSidebar}
           section={activeNav}
           genres={sectionGenres}
           sort={secSort}
@@ -868,6 +1086,8 @@ export default function App() {
           popular={POPULAR}
           onPick={handleSearch}
           onClearRecents={clearRecents}
+          settingsTab={settingsTab}
+          onSettingsTab={setSettingsTab}
         />
         <main className="main">
           <div className="content">
@@ -881,6 +1101,7 @@ export default function App() {
                 recents={recents}
                 popular={POPULAR}
                 sections={sections}
+                featured={featuredItems}
                 onSearch={handleSearch}
                 onAddMagnet={addMagnet}
                 onClearRecents={clearRecents}
@@ -892,7 +1113,22 @@ export default function App() {
             {activeSection === "tvshows" ? (
               <TvShows onPlayLocal={playLocal} onPlay={startStream} onAddToLibrary={downloadToLibrary} posterFor={posterForTitle} onReplacePoster={setReplaceTitle} />
             ) : activeSection === "music" ? (
-              <Music onPlayLocal={playLocal} onReplacePoster={setReplaceTitle} />
+              <>
+                <div className="seg music-tabbar">
+                  <button className={musicTab === "browse" ? "active" : ""} onClick={() => setMusicTab("browse")}>Music</button>
+                  <button className={musicTab === "playlists" ? "active" : ""} onClick={() => setMusicTab("playlists")}>Playlists</button>
+                  {!IS_IOS && IN_TAURI && (
+                    <button className={musicTab === "sync" ? "active" : ""} onClick={() => setMusicTab("sync")}>Sync</button>
+                  )}
+                </div>
+                {musicTab === "playlists" ? (
+                  <Playlists />
+                ) : musicTab === "sync" && !IS_IOS && IN_TAURI ? (
+                  <Sync />
+                ) : (
+                  <Music onPlayLocal={playLocal} onReplacePoster={setReplaceTitle} />
+                )}
+              </>
             ) : activeSection === "movies" ? (
               <Movies onPlayLocal={playLocal} posterFor={posterForTitle} onReplacePoster={setReplaceTitle} />
             ) : null}
@@ -913,8 +1149,8 @@ export default function App() {
             )}
             {view === "downloads" && (
               <Downloads
-                downloads={downloads.filter((d) => !d.id.startsWith("local:"))}
-                onOpen={openPlayer}
+                downloads={companionMode ? remoteDownloads : downloads.filter((d) => !d.id.startsWith("local:"))}
+                onOpen={companionMode ? openRemoteDownload : openPlayer}
                 onRemove={removeDownload}
                 onPause={handlePause}
                 onReveal={handleReveal}
@@ -934,7 +1170,7 @@ export default function App() {
                 }}
               />
             )}
-            {view === "settings" && <Settings onCatalogChanged={refreshCatalog} />}
+            {view === "settings" && <Settings onCatalogChanged={refreshCatalog} tab={settingsTab} />}
             {view === "player" && activeItem && (
               <Player
                 item={activeItem}
@@ -943,6 +1179,7 @@ export default function App() {
                 info={media}
                 onBack={() => setView(prevView)}
                 onPlayEpisode={playEpisode}
+                onPlayAnimeEpisode={playAnimeEpisode}
               />
             )}
             <SpotifyReplicate
@@ -970,6 +1207,26 @@ export default function App() {
               }}
             />
           </div>
+          {digestItem && (
+            <div className="digest-overlay">
+              <Digest
+                item={digestItem}
+                onBack={() => setDigestItem(null)}
+                onStream={() => {
+                  if (!digestItem) return;
+                  const it = digestItem;
+                  setDigestItem(null);
+                  void streamNow(it, mediaKind(it.title, it.category));
+                }}
+                onDownload={() => {
+                  if (!digestItem) return;
+                  const it = digestItem;
+                  setDigestItem(null);
+                  void downloadToLibrary(it);
+                }}
+              />
+            </div>
+          )}
         </main>
       </div>
     </div>

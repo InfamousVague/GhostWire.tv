@@ -516,12 +516,23 @@ body {
   min-width: 0;
   margin-left: 10px;
   overflow: hidden;
+  position: relative; /* positioning context for the digest overlay */
 }
 
 .content {
   flex: 1;
   overflow-y: auto;
   padding: 18px 22px 22px;
+}
+
+/* The movie/show details digest covers the content area (its own scroll). */
+.digest-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  overflow-y: auto;
+  background: #000;
+  padding: 18px 22px 92px;
 }
 
 /* ---------- Catalog header ---------- */
@@ -567,6 +578,9 @@ body {
   gap: 6px;
 }
 .seg button.active { background: var(--gg-surface-2); color: var(--gg-text); }
+
+/* Music ↔ Playlists sub-tab toggle at the top of the Music section. */
+.music-tabbar { margin-bottom: 14px; }
 
 /* ---------- Search home ---------- */
 .search-page { max-width: 1100px; margin: 0 auto; }
@@ -853,6 +867,19 @@ body {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+.poster-ep {
+  margin-top: 5px;
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--gg-text);
+  background: var(--gg-surface-2);
+  border: 1px solid var(--gg-border);
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
 }
 .poster-info {
   margin-top: 5px;
@@ -1548,39 +1575,15 @@ body {
 .ctx-item.danger:hover { background: color-mix(in srgb, var(--gg-hot) 14%, transparent); }
 .ctx-item.divided { margin-top: 4px; border-top: 1px solid var(--gg-border); padding-top: 10px; }
 
-/* ---------- Frosted content cards over the water backdrop ----------
-   Downloads / Sources / Settings panels go translucent so the blurred water
-   background glows through them (the glass theme, carried into Downloads). */
+/* ---------- Content cards on the solid-black shell ----------
+   The glass-over-water effect was removed, so cards are opaque surfaces. */
 .content .card {
-  background: color-mix(in srgb, var(--color-bg-secondary) 55%, transparent);
-  -webkit-backdrop-filter: blur(22px) saturate(140%);
-  backdrop-filter: blur(22px) saturate(140%);
+  background: var(--gg-surface);
 }
 
-/* ---------- Ambient water backdrop (restored) ----------
-   A blurred photo (free, via Lorem Picsum → Unsplash) behind the whole shell, so the
-   frosted chrome + cards have water to refract — including Downloads. Kept at the end
-   of the file so it wins over the opaque `.app`/`.content` base rules above. */
-body::before {
-  content: "";
-  position: fixed;
-  /* Slight overscan so the soft blurred edges sit off-screen (no transparent rim). */
-  inset: -20px;
-  z-index: 0;
-  pointer-events: none;
-  background-color: #000;
-  /* Solid black at the top, fading to mostly-transparent at the bottom so the image
-     only shows toward the bottom of the shell. */
-  background-image:
-    linear-gradient(180deg, #000 0%, #000 24%, rgba(0, 0, 0, 0.14) 100%),
-    url("https://picsum.photos/seed/blackpearl-glass/2400/1500?blur=3");
-  background-size: cover;
-  background-position: center;
-  background-repeat: no-repeat;
-  filter: blur(1px);
-}
+/* Solid-black shell (the ambient water backdrop was removed). */
 #root { position: relative; z-index: 1; height: 100%; }
-.app { background: transparent; }
+.app { background: #000; }
 .app-body,
 .main,
 .content { background: transparent; }
@@ -1870,7 +1873,10 @@ html, body { overscroll-behavior: none; }
 /* Safe-area insets (notch / Dynamic Island / home indicator). viewport-fit=cover
  * populates env(); max() guards the WKWebView quirk where they're briefly 0. */
 .is-ios .nav-rail {
-  margin-top: max(10px, env(safe-area-inset-top));
+  /* The topbar already reserves the top safe-area (its padding-top below), so the rail
+   * only needs the normal floating-card gap — not a second inset. This also aligns the
+   * rail's top with the adjacent sidebar (which uses 10px). */
+  margin-top: 10px;
   margin-bottom: max(10px, env(safe-area-inset-bottom));
   margin-left: max(10px, env(safe-area-inset-left));
 }
@@ -2013,6 +2019,12 @@ html, body { overscroll-behavior: none; }
 }
 .yt-sub-item:hover { background: rgba(255, 255, 255, 0.10); }
 .yt-sub-item.on { color: var(--gg-accent); font-weight: 600; }
+.yt-sub-item.is-busy, .yt-sub-item.is-muted {
+  display: flex; align-items: center; gap: 6px; color: var(--gg-text-dim); cursor: default;
+}
+.yt-sub-item.is-busy:hover, .yt-sub-item.is-muted:hover { background: transparent; }
+.yt-sub-item > svg { vertical-align: -2px; margin-right: 4px; }
+.yt-sub-sep { height: 1px; margin: 5px 4px; background: rgba(255, 255, 255, 0.12); }
 .yt-vol { display: flex; align-items: center; }
 .yt-vol-slider { width: 0; opacity: 0; transition: width 0.16s ease, opacity 0.16s ease; accent-color: #fff; cursor: pointer; }
 .yt-vol:hover .yt-vol-slider, .yt-vol:focus-within .yt-vol-slider { width: 76px; opacity: 1; margin: 0 4px; }

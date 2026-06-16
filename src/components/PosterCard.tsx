@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Chip } from "@mattmattmattmatt/base/primitives/chip/Chip";
 import type { CatalogItem, Category } from "../lib/types";
-import { CATEGORY_LABEL, cleanRelease, hueFromString } from "../lib/catalog";
+import { CATEGORY_LABEL, cleanRelease, hueFromString, seasonEpisodeLabel } from "../lib/catalog";
 import { formatBytes, formatCount, timeAgo } from "../lib/format";
 import { circleCheck, circlePlay, download as downloadIcon, film, flame, hardDrive } from "../lib/icons";
 
@@ -24,6 +24,8 @@ export function PosterCard({
   const [queued, setQueued] = useState(false);
   // Prefer the LLM/cached clean title; otherwise an instant regex clean of the raw name.
   const title = item.cleanTitle?.trim() || cleanRelease(item.title);
+  // The clean title drops S01E02 etc., so surface it back as a metadata line.
+  const ep = seasonEpisodeLabel(item.title);
   const hue = hueFromString(item.title);
   const bg = `linear-gradient(150deg, hsl(${hue} 32% 24%), hsl(${(hue + 40) % 360} 42% 13%))`;
   return (
@@ -66,6 +68,7 @@ export function PosterCard({
       </div>
       <div className="poster-meta">
         <div className="poster-name" title={title}>{title}</div>
+        {ep && <div className="poster-ep">{ep}</div>}
         <div className="poster-info">
           <span>{formatBytes(item.sizeBytes)}</span>
           <span className="dot" />

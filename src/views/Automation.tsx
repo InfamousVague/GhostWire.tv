@@ -10,11 +10,16 @@ import {
   tagPlan,
   tagApply,
   convertAudio,
+  dedupePlan,
+  dedupeApply,
   onTagProgress,
   onConvertProgress,
+  onDedupeProgress,
   type TagResult,
   type ConvertResult,
+  type DedupeResult,
 } from "../ipc/automation";
+import { formatBytes } from "../lib/format";
 import {
   sparkles,
   cpu,
@@ -23,6 +28,8 @@ import {
   arrowDownUp,
   folderOpen,
   circleCheck,
+  copy,
+  trash2,
   music,
 } from "../lib/icons";
 
@@ -56,6 +63,12 @@ export function Automation({ onOrganize, onChanged }: { onOrganize: () => void; 
   const [convRes, setConvRes] = useState<ConvertResult | null>(null);
   const [convErr, setConvErr] = useState<string | null>(null);
 
+  // Dedupe task.
+  const [dedupePhase, setDedupePhase] = useState<Phase>("idle");
+  const [dedupeProg, setDedupeProg] = useState({ done: 0, total: 0 });
+  const [dedupeRes, setDedupeRes] = useState<DedupeResult | null>(null);
+  const [dedupeErr, setDedupeErr] = useState<string | null>(null);
+
   useEffect(() => {
     if (!IN_TAURI) return;
     aiStatus().then(setAi).catch(() => {});
@@ -68,9 +81,11 @@ export function Automation({ onOrganize, onChanged }: { onOrganize: () => void; 
     // resolve (avoids a leaked listener firing setState after unmount).
     const pT = onTagProgress((p) => setTagProg({ done: p.done, total: p.total }));
     const pC = onConvertProgress((p) => setConvProg({ done: p.done, total: p.total }));
+    const pD = onDedupeProgress((p) => setDedupeProg({ done: p.done, total: p.total }));
     return () => {
       void pT.then((f) => f());
       void pC.then((f) => f());
+      void pD.then((f) => f());
     };
   }, []);
 
@@ -158,9 +173,46 @@ export function Automation({ onOrganize, onChanged }: { onOrganize: () => void; 
     }
   }
 
+  async function runDedupeScan() {
+    if (!IN_TAURI) return;
+    setDedupePhase("running");
+    setDedupeProg({ done: 0, total: 0 });
+    setDedupeRes(null);
+    setDedupeErr(null);
+    try {
+      const r = await dedupePlan();
+      setDedupeRes(r);
+      setDedupePhase(r.groups.length > 0 ? "preview" : "done");
+    } catch (e) {
+      setDedupeErr(String(e));
+      setDedupePhase("error");
+    }
+  }
+
+  async function applyDedupe() {
+    if (!dedupeRes) return;
+    const paths = dedupeRes.groups.flatMap((g) => g.duplicates.map((d) => d.id));
+    if (paths.length === 0) {
+      setDedupePhase("done");
+      return;
+    }
+    setDedupePhase("applying");
+    setDedupeProg({ done: 0, total: paths.length });
+    try {
+      const r = await dedupeApply(paths);
+      setDedupeRes(r);
+      setDedupePhase("done");
+      onChanged?.();
+    } catch (e) {
+      setDedupeErr(String(e));
+      setDedupePhase("error");
+    }
+  }
+
   const aiOn = !!ai?.available;
   const tagPlanChanges = tagRes?.changes.filter((c) => c.status === "plan") ?? [];
   const tagBusy = tagPhase === "running" || tagPhase === "applying";
+  const dupCount = dedupeRes?.groups.reduce((n, g) => n + g.duplicates.length, 0) ?? 0;
 
   return (
     <div className="section-stack auto-page">
@@ -322,6 +374,104 @@ export function Automation({ onOrganize, onChanged }: { onOrganize: () => void; 
           <div className="auto-err">
             <span className="field-hint">{tagErr}</span>
             <Button variant="secondary" onClick={() => setTagPhase("idle")}>
+              Retry
+            </Button>
+          </div>
+        )}
+      </TaskCard>
+
+      {/* Dedupe library */}
+      <TaskCard
+        icon={copy}
+        title="Dedupe library"
+        desc="Find duplicate tracks — the same song saved more than once, a lower-quality copy, or the same recording across different albums — and move the redundant ones to the Trash, keeping the best. The local AI judges the tricky cases so live versions, remasters and remixes are kept."
+      >
+        {dedupePhase === "idle" && (
+          <Button variant="primary" icon={copy} disabled={!IN_TAURI} onClick={runDedupeScan}>
+            Scan for duplicates
+          </Button>
+        )}
+
+        {(dedupePhase === "running" || dedupePhase === "applying") && (
+          <div className="auto-run">
+            <div className="auto-run-label">
+              <Spinner size="sm" />
+              <span className="field-hint">
+                {dedupePhase === "running" ? "Scanning" : "Removing"} · {dedupeProg.done}/{dedupeProg.total || "…"}
+              </span>
+            </div>
+            {dedupeProg.total > 0 && (
+              <div className="org-progress">
+                <div
+                  className="org-progress-fill"
+                  style={{ width: `${Math.round((dedupeProg.done / dedupeProg.total) * 100)}%` }}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {dedupePhase === "preview" && dedupeRes && (
+          <div className="auto-preview-wrap">
+            <div className="auto-run-label">
+              <span className={`ai-pill ${dedupeRes.aiUsed ? "on" : "off"}`}>
+                <Icon icon={cpu} size="xs" /> {dedupeRes.aiUsed ? "AI" : "Basic"}
+              </span>
+              <span className="field-hint">
+                {dedupeRes.groups.length} duplicate group{dedupeRes.groups.length === 1 ? "" : "s"} · {dupCount} file
+                {dupCount === 1 ? "" : "s"} · frees {formatBytes(dedupeRes.bytesFreed)}
+              </span>
+            </div>
+            <div className="auto-preview">
+              {dedupeRes.groups.slice(0, 250).map((g, i) => (
+                <div className="auto-prow" key={`${g.keep}-${i}`}>
+                  <div className="auto-prow-name">
+                    <span className="auto-to" title={g.keepName}>
+                      {g.keepName}{g.keepAlbum ? ` — ${g.keepAlbum}` : ""}
+                    </span>
+                    <span className="auto-arrow">keep</span>
+                  </div>
+                  <div className="auto-tags">
+                    {g.duplicates.map((d, j) => (
+                      <span className="auto-tag dim" key={j} title={`${d.name} — ${d.album} (${formatBytes(d.sizeBytes)})`}>
+                        ✕ {d.album || d.name}
+                      </span>
+                    ))}
+                    <span className="auto-tag">{g.reason}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="form-actions">
+              <Button variant="ghost" onClick={() => setDedupePhase("idle")}>
+                Cancel
+              </Button>
+              <Button variant="primary" icon={trash2} onClick={applyDedupe}>
+                Trash {dupCount} duplicate{dupCount === 1 ? "" : "s"}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {dedupePhase === "done" && dedupeRes && (
+          <div className="auto-done">
+            <Icon icon={circleCheck} size="sm" />
+            <span>
+              {dedupeRes.removed > 0
+                ? `Removed ${dedupeRes.removed} duplicate${dedupeRes.removed === 1 ? "" : "s"} · freed ${formatBytes(dedupeRes.bytesFreed)}.`
+                : "No duplicates found."}
+              {dedupeRes.errors > 0 ? ` ${dedupeRes.errors} couldn't be removed.` : ""}
+            </span>
+            <Button variant="secondary" onClick={() => setDedupePhase("idle")}>
+              Run again
+            </Button>
+          </div>
+        )}
+
+        {dedupePhase === "error" && (
+          <div className="auto-err">
+            <span className="field-hint">{dedupeErr}</span>
+            <Button variant="secondary" onClick={() => setDedupePhase("idle")}>
               Retry
             </Button>
           </div>

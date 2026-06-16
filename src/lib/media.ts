@@ -115,6 +115,39 @@ export function parseEpisode(title: string): ParsedEpisode | null {
   return null;
 }
 
+export interface ParsedAnimeEpisode {
+  show: string;
+  /** Absolute episode number (anime numbers continuously, not per-season). */
+  episode: number;
+}
+
+/**
+ * Pull `{ show, episode }` from an anime release title, which numbers episodes
+ * absolutely rather than with S/E — e.g. `[SubsPlease] Sousou no Frieren - 28 (1080p)`,
+ * `Title Episode 28`, `Title #28`. Returns null if no episode number is found.
+ */
+export function parseAnimeEpisode(title: string): ParsedAnimeEpisode | null {
+  // Drop leading release-group tags ("[SubsPlease] …") and a file extension.
+  let t = title.replace(/[._]+/g, " ").replace(/^\s*(?:\[[^\]]*\]\s*)+/g, "");
+  t = t.replace(/\.(mkv|mp4|avi|webm|m4v)$/i, "").trim();
+  const ok = (show: string, ep: number): ParsedAnimeEpisode | null =>
+    // Reject 4-digit "episodes" that are obviously a year.
+    ep >= 1 && !(ep >= 1900 && ep <= 2100) ? { show: cleanShowName(show), episode: ep } : null;
+
+  // "Title - 28", "Title - 28v2", "Title – 28 (1080p)" — the dominant fansub pattern.
+  let m = t.match(/^(.*?)\s[-–—]\s(\d{1,4})(?:v\d+)?(?=\s|\(|\[|$)/);
+  if (m) return ok(m[1], +m[2]);
+  // "Title Episode 28" / "Title Ep 28" / "Title #28".
+  m = t.match(/^(.*?)\b(?:episode|ep)\.?\s*(\d{1,4})\b/i);
+  if (m) return ok(m[1], +m[2]);
+  m = t.match(/^(.*?)#(\d{1,4})\b/);
+  if (m) return ok(m[1], +m[2]);
+  // Last resort: a bare trailing number before quality/format tags ("Title 28 [1080p]").
+  m = t.match(/^(.*?)\s(\d{1,4})(?=\s*[([]|$)/);
+  if (m) return ok(m[1], +m[2]);
+  return null;
+}
+
 export type SectionSort = "popularity" | "rating" | "recent" | "title";
 
 export const SECTION_LABEL: Record<MediaSectionId, string> = {
@@ -137,12 +170,41 @@ const ANIME_HINT_RE = /\b(?:anime|fansub|vostfr|simuldub|softsub|hardsub|crunchy
  * an explicit `anime` genre, a known fansub group tag, or `animation` + an
  * anime-specific release marker.
  */
+/** Normalize a title for fuzzy matching: lowercase, drop "the", strip punctuation. */
+function normAnime(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\bthe\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Downloaded video carries no anime metadata (genres are TMDB-style like "Animation",
+// which also covers Western cartoons; and the AI genre isn't joined to on-disk items). So
+// for titles without a fansub tag we match against well-known anime (English + romaji).
+// This is a heuristic safety net — the robust fix is an AniList/Jikan classifier at scan time.
+const KNOWN_ANIME = [
+  "apothecary diaries", "tongari boushi", "witch hat atelier", "frieren", "spy x family",
+  "jujutsu kaisen", "demon slayer", "kimetsu no yaiba", "chainsaw man", "dandadan",
+  "attack on titan", "shingeki no kyojin", "one piece", "naruto", "bleach", "dragon ball",
+  "my hero academia", "boku no hero", "death note", "fullmetal alchemist", "hunter x hunter",
+  "one punch man", "mob psycho", "vinland saga", "oshi no ko", "blue lock", "solo leveling",
+  "mushoku tensei", "re zero", "konosuba", "overlord", "reincarnated as a slime", "tensura",
+  "bocchi", "cyberpunk edgerunners", "cowboy bebop", "evangelion", "sword art online",
+  "tokyo ghoul", "fairy tail", "black clover", "dr stone", "fire force", "haikyu",
+  "kaguya sama", "horimiya", "komi can", "made in abyss", "steins gate", "jojo",
+  "spy classroom", "dungeon meshi", "delicious in dungeon", "kaiju no 8", "wind breaker",
+].map(normAnime);
+
 export function isAnime(item: { title: string; genre?: string | null }): boolean {
   const g = (item.genre ?? "").toLowerCase();
   if (g.includes("anime")) return true;
   if (ANIME_GROUP_RE.test(item.title)) return true;
   if (/\banime\b/i.test(item.title)) return true;
   if (g.includes("animation") && ANIME_HINT_RE.test(item.title)) return true;
+  const n = normAnime(item.title);
+  if (n && KNOWN_ANIME.some((k) => n.includes(k))) return true;
   return false;
 }
 

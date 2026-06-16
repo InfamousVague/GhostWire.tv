@@ -62,6 +62,48 @@ export function convertAudio(format: "alac" | "mp3"): Promise<ConvertResult> {
   return invoke<ConvertResult>("convert_audio", { format });
 }
 
+// ---- Library de-duplication ----
+
+export interface DedupeDup {
+  /** relpath id of the redundant copy (what gets trashed). */
+  id: string;
+  name: string;
+  album: string;
+  sizeBytes: number;
+}
+
+export interface DedupeGroup {
+  /** relpath id of the copy to keep. */
+  keep: string;
+  keepName: string;
+  keepAlbum: string;
+  keepSize: number;
+  duplicates: DedupeDup[];
+  reason: string;
+  /** "exact" (same artist+album+title) or "near" (AI-judged across releases). */
+  kind: "exact" | "near";
+}
+
+export interface DedupeResult {
+  root: string;
+  groups: DedupeGroup[];
+  removed: number;
+  bytesFreed: number;
+  errors: number;
+  aiUsed: boolean;
+  model: string | null;
+}
+
+/** Dry-run: find duplicate music tracks (exact + AI-judged near-dups). Read-only. */
+export function dedupePlan(): Promise<DedupeResult> {
+  return invoke<DedupeResult>("dedupe_plan");
+}
+
+/** Move the confirmed duplicate copies (by relpath id) to the Trash; keepers untouched. */
+export function dedupeApply(paths: string[]): Promise<DedupeResult> {
+  return invoke<DedupeResult>("dedupe_apply", { paths });
+}
+
 export interface TaskProgress {
   phase: string;
   done: number;
@@ -71,6 +113,11 @@ export interface TaskProgress {
 /** Live progress while a tag plan/apply runs. Resolves to an unlisten fn. */
 export function onTagProgress(cb: (p: TaskProgress) => void): Promise<() => void> {
   return listen<TaskProgress>("tag://progress", (e) => cb(e.payload));
+}
+
+/** Live progress while a dedupe scan/apply runs. Resolves to an unlisten fn. */
+export function onDedupeProgress(cb: (p: TaskProgress) => void): Promise<() => void> {
+  return listen<TaskProgress>("dedupe://progress", (e) => cb(e.payload));
 }
 
 /** Live progress while a conversion runs. Resolves to an unlisten fn. */

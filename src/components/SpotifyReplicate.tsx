@@ -15,8 +15,9 @@ import {
   type ReplicaResult,
   type SpotifyStatus,
 } from "../ipc/spotify";
+import { spotifyToPlaylist } from "../ipc/playlists";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { circleCheck, download as downloadIcon, link2, music, pause as pauseIcon, play as playIcon, search as searchIcon } from "../lib/icons";
+import { circleCheck, download as downloadIcon, link2, listMusic, music, pause as pauseIcon, play as playIcon, search as searchIcon } from "../lib/icons";
 
 interface Props {
   open: boolean;
@@ -40,7 +41,26 @@ export function SpotifyReplicate({ open, onClose, onPlay, onDownload, initialPla
   const [result, setResult] = useState<ReplicaResult | null>(null);
   const [grabbed, setGrabbed] = useState<Set<string>>(new Set());
   const [previewing, setPreviewing] = useState<string | null>(null);
+  const [savedPlaylist, setSavedPlaylist] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Persist the linked playlist as a real manifest (songs grouped, exportable),
+  // in addition to the per-track source matching the replicate view shows.
+  async function saveAsPlaylist() {
+    const pl = playlist.trim();
+    if (!pl) return;
+    setBusy("savepl");
+    setError(null);
+    setSavedPlaylist(null);
+    try {
+      const p = await spotifyToPlaylist(pl);
+      setSavedPlaylist(`Saved “${p.name}” to Playlists — ${p.tracks.length} song${p.tracks.length === 1 ? "" : "s"}.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
 
   // Queue a chosen match for download and mark its row done.
   function grab(m: CatalogItem) {
@@ -137,6 +157,7 @@ export function SpotifyReplicate({ open, onClose, onPlay, onDownload, initialPla
     setResult(null);
     setGrabbed(new Set());
     setPreviewing(null);
+    setSavedPlaylist(null);
     try {
       setResult(await spotifyReplicate(pl));
     } catch (e) {
@@ -228,6 +249,9 @@ export function SpotifyReplicate({ open, onClose, onPlay, onDownload, initialPla
                     {matched}/{result.tracks.length} matched
                     {result.total > result.tracks.length ? ` · first ${result.tracks.length} of ${result.total}` : ""}
                   </span>
+                  <Button variant="ghost" size="sm" icon={listMusic} loading={busy === "savepl"} onClick={saveAsPlaylist}>
+                    Save as playlist
+                  </Button>
                   {matched > 0 && (
                     <Button variant="secondary" size="sm" icon={downloadIcon} onClick={downloadAll}>
                       Download all best
@@ -236,6 +260,7 @@ export function SpotifyReplicate({ open, onClose, onPlay, onDownload, initialPla
                 </div>
               )}
             </div>
+            {savedPlaylist && <p className="settings-status">{savedPlaylist}</p>}
 
             {busy === "replicate" && (
               <div className="spotify-loading">

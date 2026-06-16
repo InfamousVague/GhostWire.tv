@@ -35,9 +35,11 @@ export interface OrganizeStep {
 }
 
 /** Incrementally organize the downloads into a separate Organized/ library, one file at
- *  a time. Resumable — already-organized files are skipped on the next run. */
-export function organizeRun(): Promise<OrganizeResult> {
-  return invoke<OrganizeResult>("organize_run");
+ *  a time. Resumable — already-organized files are skipped on the next run. Pass
+ *  `includeMusic: false` to leave audio alone (SpotiFLAC already nests it by Artist/Album);
+ *  omit it (or pass true) to organize music too. */
+export function organizeRun(includeMusic?: boolean): Promise<OrganizeResult> {
+  return invoke<OrganizeResult>("organize_run", { includeMusic });
 }
 
 /** Subscribe to per-file progress while the incremental organize runs. */

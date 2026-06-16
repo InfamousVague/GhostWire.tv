@@ -25,6 +25,10 @@ pub struct PlaylistTrack {
     /// open.spotify.com link, when this came from Spotify.
     #[serde(default)]
     pub spotify_url: Option<String>,
+    /// Loopback stream URL the player can play. Recomputed on every read, so the
+    /// stored value (if any) is just a harmless cache.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

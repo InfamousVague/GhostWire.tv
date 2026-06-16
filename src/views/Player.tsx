@@ -3,18 +3,39 @@ import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Spinner } from "@mattmattmattmatt/base/primitives/spinner/Spinner";
 import type { DownloadStats, MediaInfo } from "../lib/types";
 import { formatBytes, formatBytesPerSec, formatCount } from "../lib/format";
-import { parseEpisode } from "../lib/media";
-import { IN_TAURI, listSubtitles, type SubTrack } from "../ipc/engine";
+import { isAnime, parseAnimeEpisode, parseEpisode } from "../lib/media";
+import { cleanRelease } from "../lib/catalog";
+import { fetchSubtitles, IN_TAURI, listSubtitles, type SubTrack } from "../ipc/engine";
 import { IS_IOS } from "../lib/platform";
-import { tvEpisodes, tvSearch, type TvEpisode, type TvShow } from "../ipc/library";
+import { getSetting, setSetting, tvEpisodes, tvSearch, type TvEpisode, type TvShow } from "../ipc/library";
+import { animeDetail, type AnimeDetail } from "../ipc/anime";
 import { ShowPanel } from "../components/ShowPanel";
 import {
-  arrowDown, arrowUp, captions, chevronLeft, gauge, maximize, minimize, music,
-  pause, play, rectangleHorizontal, users, volume2, volumeX,
+  airplay, arrowDown, arrowUp, captions, chevronLeft, gauge, maximize, minimize, music,
+  pause, play, rectangleHorizontal, search as searchIcon, users, volume2, volumeX,
 } from "../lib/icons";
+
+/** WebKit AirPlay surface on <video> (Safari/WKWebView; not in the TS DOM lib). */
+type AirplayVideo = HTMLVideoElement & {
+  webkitShowPlaybackTargetPicker?: () => void;
+  webkitCurrentPlaybackTargetIsWireless?: boolean;
+};
 
 const pad = (n: number) => String(n).padStart(2, "0");
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Normalize a subtitle language to a 3-letter id so a torrent's ".en.srt" and an
+// OpenSubtitles "eng" track compare equal (and the saved preference is consistent).
+const ISO3: Record<string, string> = {
+  en: "eng", es: "spa", fr: "fre", de: "ger", it: "ita", pt: "por", ja: "jpn",
+  ko: "kor", zh: "chi", ru: "rus", ar: "ara", nl: "dut", sv: "swe", pl: "pol",
+};
+const iso3 = (l: string): string => {
+  const x = (l || "").toLowerCase();
+  return x.length === 2 ? (ISO3[x] ?? x) : x;
+};
+// Settings key for the remembered subtitle language (or "off").
+const SUB_PREF_KEY = "subtitle_lang";
 
 function fmtTime(s: number): string {
   if (!Number.isFinite(s) || s < 0) return "0:00";
@@ -35,6 +56,13 @@ export interface PlayerItem {
   url?: string;
   /** Relative path under the download folder (local files only) — drives subtitle lookup. */
   relpath?: string;
+  /** Local episode context — downloaded files carry a clean show name + parsed S/E, which
+   *  the release title (used for streams) no longer has, so the show panel needs them passed. */
+  show?: string;
+  season?: number | null;
+  episode?: number | null;
+  /** Known-anime hint from the library (genre/heuristic) for the below-player panel. */
+  isAnime?: boolean;
 }
 
 interface PlayerProps {
@@ -44,6 +72,8 @@ interface PlayerProps {
   info?: MediaInfo | null;
   onBack: () => void;
   onPlayEpisode?: (show: string, season: number, episode: number) => Promise<boolean>;
+  /** Play an anime episode by absolute number (anime numbers continuously, no S/E). */
+  onPlayAnimeEpisode?: (title: string, episode: number) => Promise<boolean>;
 }
 
 function fmtContainer(c?: string | null): string {
@@ -56,12 +86,17 @@ function fmtContainer(c?: string | null): string {
   return c.split(",")[0].toUpperCase();
 }
 
-export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: PlayerProps) {
+export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, onPlayAnimeEpisode }: PlayerProps) {
   const dlPct = Math.round((stats?.progress ?? 0) * 100);
 
-  // TV context: parse the release title → show + S/E, then pull the real show
-  // metadata + episode list from TVMaze so the player reads like Prime/Netflix.
-  const ep = useMemo(() => (item.kind === "audio" ? null : parseEpisode(item.title)), [item.title, item.kind]);
+  // TV context: prefer explicit S/E (downloaded local files carry it), else parse it from
+  // the release title (streams), then pull the real show metadata + episode list from TVMaze.
+  const ep = useMemo(() => {
+    if (item.kind === "audio") return null;
+    if (item.show && item.season != null && item.episode != null)
+      return { show: item.show, season: item.season, episode: item.episode };
+    return parseEpisode(item.title);
+  }, [item.kind, item.show, item.season, item.episode, item.title]);
   const [show, setShow] = useState<TvShow | null>(null);
   const [episodes, setEpisodes] = useState<TvEpisode[]>([]);
   useEffect(() => {
@@ -89,8 +124,57 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
   }, [ep?.show]);
 
   const currentEp = ep ? episodes.find((e) => e.season === ep.season && e.number === ep.episode) : undefined;
-  const hasShow = Boolean(ep && show);
   const isAudio = item.kind === "audio";
+
+  // Anime context: anime numbers episodes absolutely (no S/E) and often isn't in TVMaze,
+  // so we detect it by title + fansub heuristics, then pull synopsis + episodes from
+  // AniList/MyAnimeList and feed the SAME panel as TV shows.
+  const animeRelease = useMemo(() => {
+    if (isAudio) return null;
+    const isAni = item.isAnime ?? isAnime({ title: item.show || item.title });
+    if (!isAni) return null;
+    // Local files carry the absolute episode number explicitly; streams parse it from the title.
+    if (item.episode != null) return { show: item.show || item.title, episode: item.episode };
+    return parseAnimeEpisode(item.title);
+  }, [isAudio, item.isAnime, item.show, item.episode, item.title]);
+  const [animeInfo, setAnimeInfo] = useState<AnimeDetail | null>(null);
+  useEffect(() => {
+    setAnimeInfo(null);
+    if (!animeRelease || !IN_TAURI) return;
+    let alive = true;
+    animeDetail(animeRelease.show).then((d) => { if (alive) setAnimeInfo(d); }).catch(() => {});
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [animeRelease?.show]);
+
+  // Adapt the anime detail into the TvShow/TvEpisode shapes the ShowPanel renders.
+  const anime = useMemo(() => {
+    if (!animeInfo || !animeRelease) return null;
+    const d = animeInfo;
+    const show: TvShow = {
+      id: d.malId ?? d.anilistId ?? 0,
+      name: d.titleEnglish || d.title,
+      year: d.year ?? null,
+      poster: d.poster ?? null,
+      network: d.format ?? "Anime",
+      genres: d.genres ?? [],
+      summary: d.synopsis ?? null,
+    };
+    const byNum = new Map((d.episodeList ?? []).map((e) => [e.number, e]));
+    // Build a contiguous 1..N list (titles where known), capped so huge runs stay light.
+    const count = Math.min(Math.max(d.episodes ?? 0, d.episodeList?.length ?? 0, animeRelease.episode), 500);
+    const list: TvEpisode[] = Array.from({ length: count }, (_, i) => {
+      const number = i + 1;
+      const m = byNum.get(number);
+      return { season: 1, number, name: m?.title ?? "", airdate: m?.airdate ?? null };
+    });
+    return { show, episodes: list, current: animeRelease.episode, searchTitle: d.title };
+  }, [animeInfo, animeRelease]);
+
+  // Anime panel wins when resolved (it's gated on the anime heuristic); otherwise the
+  // TVMaze panel shows for normal TV.
+  const hasAnime = Boolean(anime);
+  const hasShow = Boolean(ep && show) && !hasAnime;
 
   // --- media source (+ HLS fallback for codecs WebKit can't decode) ---
   const [src, setSrc] = useState<string | undefined>(streamUrl);
@@ -101,18 +185,91 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
   }, [streamUrl]);
   const transcoding = !isAudio && !!src && src.includes("/hls/");
 
-  // --- subtitles (local video only): sidecar + embedded tracks, served as WebVTT ---
+  // --- subtitles: sidecar + embedded tracks, served as WebVTT. Works for downloaded
+  // files (item.relpath) AND active streams (the engine reports the file's relpath in
+  // MediaInfo once the torrent resolves, so subs appear without waiting for a download). ---
   const [subs, setSubs] = useState<SubTrack[]>([]);
   const [activeSub, setActiveSub] = useState(-1); // -1 = off
   const [subMenu, setSubMenu] = useState(false);
+  const [fetchingSubs, setFetchingSubs] = useState(false);
+  const [subError, setSubError] = useState(false);
+  const subRel = item.relpath ?? info?.relPath ?? null;
+
+  // Remembered subtitle language (learned from what the user selects) — drives which track
+  // auto-enables and what language we fetch when a video has none. "off" = user opted out.
+  const [prefLang, setPrefLang] = useState<string>("");
+  useEffect(() => {
+    if (IN_TAURI) getSetting(SUB_PREF_KEY).then((v) => setPrefLang(v ?? "")).catch(() => {});
+  }, []);
+  const rememberLang = useCallback((lang: string) => {
+    setPrefLang(lang);
+    if (IN_TAURI) void setSetting(SUB_PREF_KEY, lang).catch(() => {});
+  }, []);
+  // Language to fetch when a video has no captions: the remembered one, else English.
+  const fetchLang = prefLang && prefLang !== "off" ? prefLang : "eng";
+
+  // What to search OpenSubtitles for: show name + S/E for TV, romaji + absolute episode
+  // for anime, else a cleaned movie title.
+  const subQuery = useMemo(() => {
+    if (anime) return { title: anime.searchTitle, season: null as number | null, episode: anime.current };
+    if (ep) return { title: ep.show, season: ep.season as number | null, episode: ep.episode as number | null };
+    return { title: cleanRelease(item.title), season: null as number | null, episode: null as number | null };
+  }, [anime, ep, item.title]);
+
+  /** Search OpenSubtitles (free, keyless) + save the best match next to the video. */
+  const searchOnline = useCallback(async () => {
+    if (isAudio || !subRel || !IN_TAURI) return;
+    setFetchingSubs(true);
+    setSubError(false);
+    try {
+      const next = await fetchSubtitles(subRel, subQuery.title, subQuery.season, subQuery.episode, fetchLang);
+      setSubs(next);
+      setSubError(next.length === 0);
+    } catch {
+      setSubError(true);
+    } finally {
+      setFetchingSubs(false);
+    }
+  }, [isAudio, subRel, subQuery, fetchLang]);
+
+  // Look up subtitles for the file; if it has NONE, auto-fetch one online (free) so a video
+  // that "arrives with none" still gets captions without the user hunting for them.
   useEffect(() => {
     setSubs([]);
     setActiveSub(-1);
-    if (isAudio || !item.relpath || !IN_TAURI) return;
+    setSubError(false);
+    if (isAudio || !subRel || !IN_TAURI) return;
     let alive = true;
-    listSubtitles(item.relpath).then((t) => { if (alive) setSubs(t); }).catch(() => {});
+    (async () => {
+      const local = await listSubtitles(subRel).catch(() => [] as SubTrack[]);
+      if (!alive) return;
+      if (local.length > 0) {
+        setSubs(local);
+        return;
+      }
+      setFetchingSubs(true);
+      try {
+        const online = await fetchSubtitles(subRel, subQuery.title, subQuery.season, subQuery.episode, fetchLang);
+        if (alive) setSubs(online);
+      } catch {
+        /* offline / rate-limited — leave the manual "Search online" option */
+      } finally {
+        if (alive) setFetchingSubs(false);
+      }
+    })();
     return () => { alive = false; };
-  }, [item.relpath, isAudio]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subRel, isAudio, subQuery.title, subQuery.season, subQuery.episode, fetchLang]);
+
+  // Auto-enable the track matching the remembered language (Netflix-style). Only when the
+  // user has a preference and hasn't already turned a track on this session — never forces
+  // captions on someone who's chosen "off" or hasn't picked a language yet.
+  useEffect(() => {
+    if (activeSub !== -1 || !prefLang || prefLang === "off" || subs.length === 0) return;
+    const idx = subs.findIndex((s) => iso3(s.lang) === prefLang);
+    if (idx >= 0) setActiveSub(idx);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subs, prefLang]);
   // The browser only loads a VTT when its track mode isn't "disabled" — so toggle modes
   // (not the `default` attr) to switch the showing track. Re-applied when tracks/src change.
   useEffect(() => {
@@ -136,6 +293,11 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
   const [isFs, setIsFs] = useState(false);
   const [chromeShown, setChromeShown] = useState(true);
   const [statsOpen, setStatsOpen] = useState(false);
+  // AirPlay (WebKit): the custom controls replace the native bar, so we surface our own
+  // route-picker button. Supported = the WebKit picker API exists; `airplaying` reflects
+  // whether playback is currently routed to a wireless target.
+  const [airplaySupported, setAirplaySupported] = useState(false);
+  const [airplaying, setAirplaying] = useState(false);
   const hideTimer = useRef<number | undefined>(undefined);
 
   // Buffering debounce: a stall only counts as "buffering" (→ spinner + chrome) if it
@@ -241,6 +403,24 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
     setMuted(next);
   }, []);
 
+  const showAirplayPicker = useCallback(() => {
+    (media() as AirplayVideo | null)?.webkitShowPlaybackTargetPicker?.();
+  }, []);
+
+  // Detect AirPlay support + track whether we're currently casting (re-bound per source).
+  useEffect(() => {
+    const v = videoRef.current as AirplayVideo | null;
+    if (!v) return;
+    // Opt this element into AirPlay so the route picker can target it (hyphenated
+    // custom attrs don't type-check in JSX, so set it imperatively).
+    v.setAttribute("x-webkit-airplay", "allow");
+    setAirplaySupported(typeof v.webkitShowPlaybackTargetPicker === "function");
+    const onWireless = () => setAirplaying(Boolean(v.webkitCurrentPlaybackTargetIsWireless));
+    onWireless();
+    v.addEventListener("webkitcurrentplaybacktargetiswirelesschanged", onWireless);
+    return () => v.removeEventListener("webkitcurrentplaybacktargetiswirelesschanged", onWireless);
+  }, [src]);
+
   const toggleFullscreen = useCallback(() => {
     const el = stageRef.current as (HTMLDivElement & { webkitRequestFullscreen?: () => void }) | null;
     const doc = document as Document & { webkitFullscreenElement?: Element; webkitExitFullscreen?: () => void };
@@ -320,13 +500,16 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
     );
   }
 
-  const title = hasShow && show ? show.name : item.title;
-  const sub = hasShow && ep
-    ? `S${pad(ep.season)}E${pad(ep.episode)}${currentEp?.name ? ` · ${currentEp.name}` : ""}`
-    : [item.sizeBytes ? formatBytes(item.sizeBytes) : "", item.source].filter(Boolean).join(" · ");
+  const currentAnimeEp = anime?.episodes.find((e) => e.number === anime.current);
+  const title = anime ? anime.show.name : hasShow && show ? show.name : item.title;
+  const sub = anime
+    ? `Episode ${anime.current}${currentAnimeEp?.name ? ` · ${currentAnimeEp.name}` : ""}`
+    : hasShow && ep
+      ? `S${pad(ep.season)}E${pad(ep.episode)}${currentEp?.name ? ` · ${currentEp.name}` : ""}`
+      : [item.sizeBytes ? formatBytes(item.sizeBytes) : "", item.source].filter(Boolean).join(" · ");
 
   return (
-    <div className={`player yt${hasShow ? " has-show" : ""}`}>
+    <div className={`player yt${hasShow || hasAnime ? " has-show" : ""}`}>
       <div
         ref={stageRef}
         className={`yt-stage${chromeVisible ? " chrome" : " hide-cursor"}${isFs ? " is-fs" : ""}`}
@@ -441,35 +624,53 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
                 <span className="yt-time">{fmtTime(time)} <span className="yt-time-dim">/ {fmtTime(duration)}</span></span>
                 {dlPct < 100 && <span className="yt-dl" title="Downloaded so far"><Icon icon={arrowDown} size="xs" />{dlPct}%</span>}
                 <div className="yt-spacer" />
-                {subs.length > 0 && (
-                  <div className="yt-sub-wrap">
-                    {subMenu && (
-                      <div className="yt-sub-menu" role="menu">
-                        <button className={`yt-sub-item${activeSub === -1 ? " on" : ""}`} onClick={() => { setActiveSub(-1); setSubMenu(false); }}>
-                          Off
+                <div className="yt-sub-wrap">
+                  {subMenu && (
+                    <div className="yt-sub-menu" role="menu">
+                      <button className={`yt-sub-item${activeSub === -1 ? " on" : ""}`} onClick={() => { setActiveSub(-1); rememberLang("off"); setSubMenu(false); }}>
+                        Off
+                      </button>
+                      {subs.map((s, i) => (
+                        <button
+                          key={s.url}
+                          className={`yt-sub-item${activeSub === i ? " on" : ""}`}
+                          onClick={() => { setActiveSub(i); if (s.lang) rememberLang(iso3(s.lang)); setSubMenu(false); }}
+                        >
+                          {s.label}
                         </button>
-                        {subs.map((s, i) => (
-                          <button key={s.url} className={`yt-sub-item${activeSub === i ? " on" : ""}`} onClick={() => { setActiveSub(i); setSubMenu(false); }}>
-                            {s.label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                    <button
-                      className={`yt-iconbtn${activeSub >= 0 ? " on" : ""}`}
-                      aria-label="Subtitles"
-                      title="Subtitles"
-                      aria-haspopup="menu"
-                      aria-expanded={subMenu}
-                      onClick={() => setSubMenu((o) => !o)}
-                    >
-                      <Icon icon={captions} size="base" />
-                    </button>
-                  </div>
-                )}
+                      ))}
+                      {/* Free, keyless OpenSubtitles search — auto-runs once when a video has
+                          none, and is available here to (re-)search on demand. */}
+                      <div className="yt-sub-sep" />
+                      {fetchingSubs ? (
+                        <span className="yt-sub-item is-busy"><Spinner size="xs" /> Searching online…</span>
+                      ) : (
+                        <button className="yt-sub-item" onClick={() => void searchOnline()}>
+                          <Icon icon={searchIcon} size="xs" /> {subs.length > 0 ? "Search online again" : "Search online (free)"}
+                        </button>
+                      )}
+                      {subError && <span className="yt-sub-item is-muted">No subtitles found online</span>}
+                    </div>
+                  )}
+                  <button
+                    className={`yt-iconbtn${activeSub >= 0 ? " on" : ""}`}
+                    aria-label="Subtitles"
+                    title={fetchingSubs ? "Finding subtitles…" : "Subtitles"}
+                    aria-haspopup="menu"
+                    aria-expanded={subMenu}
+                    onClick={() => setSubMenu((o) => !o)}
+                  >
+                    {fetchingSubs ? <Spinner size="xs" /> : <Icon icon={captions} size="base" />}
+                  </button>
+                </div>
                 <button className={`yt-iconbtn${statsOpen ? " on" : ""}`} aria-label="Stats" title="Stats for nerds" onClick={() => setStatsOpen((s) => !s)}>
                   <Icon icon={gauge} size="base" />
                 </button>
+                {airplaySupported && (
+                  <button className={`yt-iconbtn${airplaying ? " on" : ""}`} aria-label="AirPlay" title="AirPlay" onClick={showAirplayPicker}>
+                    <Icon icon={airplay} size="base" />
+                  </button>
+                )}
                 {isFs && <button className="yt-iconbtn" aria-label="Theatre" title="Exit fullscreen" onClick={toggleFullscreen}><Icon icon={rectangleHorizontal} size="base" /></button>}
                 <button className="yt-iconbtn" aria-label="Fullscreen" title="Fullscreen (f)" onClick={toggleFullscreen}>
                   <Icon icon={isFs ? minimize : maximize} size="base" />
@@ -491,7 +692,9 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
         <div className="yt-below">
           <h1 className="yt-watch-title">{title}</h1>
           <div className="yt-watch-meta">
-            {hasShow && ep ? (
+            {anime ? (
+              <>Episode {anime.current}{currentAnimeEp?.name ? ` · ${currentAnimeEp.name}` : ""}{currentAnimeEp?.airdate ? ` · ${currentAnimeEp.airdate}` : ""}</>
+            ) : hasShow && ep ? (
               <>S{pad(ep.season)}E{pad(ep.episode)}{currentEp?.name ? ` · ${currentEp.name}` : ""}{currentEp?.airdate ? ` · ${currentEp.airdate}` : ""}</>
             ) : (
               <>{item.sizeBytes ? formatBytes(item.sizeBytes) : "Live stream"}{item.source ? ` · ${item.source}` : ""}</>
@@ -502,7 +705,16 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
             <span className="pstat"><Icon icon={users} size="xs" />{formatCount(stats?.peers ?? 0)}</span>
           </div>
 
-          {hasShow && show && ep && (
+          {anime ? (
+            <ShowPanel
+              show={anime.show}
+              episodes={anime.episodes}
+              season={1}
+              episode={anime.current}
+              absolute
+              onPlayEpisode={(_s, _se, e) => Promise.resolve(onPlayAnimeEpisode?.(anime.searchTitle, e) ?? false)}
+            />
+          ) : hasShow && show && ep ? (
             <ShowPanel
               show={show}
               episodes={episodes}
@@ -510,7 +722,7 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode }: 
               episode={ep.episode}
               onPlayEpisode={(s, se, e) => Promise.resolve(onPlayEpisode?.(s, se, e) ?? false)}
             />
-          )}
+          ) : null}
         </div>
       )}
     </div>
