@@ -3842,6 +3842,25 @@ async fn download_http_file(
         .build()
         .map_err(|e| e.to_string())?;
 
+    // LibGen and Anna's Archive serve detail/landing pages at the URL we get
+    // from the catalog — not the file itself. Resolve those to a direct file
+    // URL up front so the existing "reject HTML responses" guard below stays
+    // honest and the user never sees a browser window for a book download.
+    let mut owned_link: String;
+    let link: &str = if indexer::is_libgen_http_url(link) {
+        match indexer::libgen_resolve_direct_url(link).await {
+            Some(direct) => { owned_link = direct; &owned_link }
+            None => return Err("LibGen: couldn't resolve a direct download URL.".to_string()),
+        }
+    } else if indexer::is_annas_http_url(link) {
+        match indexer::annas_resolve_direct_url(link).await {
+            Some(direct) => { owned_link = direct; &owned_link }
+            None => return Err("Anna's Archive: no direct download mirror was available.".to_string()),
+        }
+    } else {
+        link
+    };
+
     let mut req = client.get(link);
     if is_zlib_http_url(link) {
         if let Some(cookie) = indexer::zlib_cookie_header(link).await {

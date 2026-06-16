@@ -16,6 +16,11 @@ use crate::catalog::CatalogItem;
 /// TPB mirror URL is made to work by falling back to apibay.
 const APIBAY: &str = "https://apibay.org";
 const ANNAS_BASE: &str = "https://annas-archive.cc";
+const LIBGEN_BASE: &str = "https://libgen.li";
+
+/// User-Agent used for in-app book downloads (Anna's / LibGen). Matches the UA
+/// the existing book scrapers use so detail pages render the mirror buttons.
+const BOOK_DL_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15";
 const INTERNET_ARCHIVE_BASE: &str = "https://archive.org";
 const ROMSGAMES_BASE: &str = "https://www.romsgames.net";
 
@@ -63,6 +68,7 @@ pub async fn run_source(kind: &str, url: &str, source_name: &str, now_ms: i64) -
                 || is_zlib(url)
                 || is_internet_archive(url)
                 || is_romsgames(url)
+                || is_libgen(url)
             {
                 return adapter_source(url, source_name, now_ms).await;
             }
@@ -127,6 +133,9 @@ fn classify_body(body: &str) -> &'static str {
     }
     if head.contains("detname") || head.contains("/torrent/") {
         return "TPB results table";
+    }
+    if body.contains("ads.php?md5=") {
+        return "LibGen results table";
     }
     if head.contains("<html") || head.contains("<!doctype") {
         return "HTML page (no listings)";
@@ -229,6 +238,9 @@ async fn adapter_source(url: &str, source_name: &str, now: i64) -> Result<Vec<Ca
     }
     if is_zlib(url) {
         return zlib_browse(url, source_name, now).await;
+    }
+    if is_libgen(url) {
+        return libgen_browse(url, source_name, now).await;
     }
     if is_internet_archive(url) {
         return internet_archive_browse(url, source_name, now).await;
@@ -632,6 +644,9 @@ pub async fn search_source(
     }
     if is_zlib(url) {
         return zlib_search(url, q, source_name, now).await;
+    }
+    if is_libgen(url) {
+        return libgen_search(url, q, source_name, now).await;
     }
     if is_internet_archive(url) {
         return internet_archive_search(url, q, source_name, now).await;
@@ -1244,6 +1259,200 @@ async fn annas_browse(url: &str, source_name: &str, now: i64) -> Result<Vec<Cata
     let base = annas_base(url);
     let body = http_get(&annas_query_url(&base, None)).await?;
     Ok(parse_annas_results(&base, &body, source_name, now))
+}
+
+// ============================ LibGen adapter ============================
+//
+// Library Genesis search returns a `<table>` of book rows. Each row carries an
+// `ads.php?md5=<hash>` mirror link; that page in turn embeds a per-session
+// `get.php?md5=<hash>&key=<key>` direct-download URL which streams the file
+// (epub/pdf/mobi) bytes back to us. The download_http_file branch in lib.rs
+// uses `libgen_resolve_direct_url` to swap detail → direct before fetching, so
+// clicking a LibGen book never opens a browser window.
+
+fn is_libgen(url: &str) -> bool {
+    let u = url.to_lowercase();
+    u.contains("libgen.") || u.contains("library.lol")
+}
+
+/// Public so lib.rs can detect LibGen URLs without re-implementing host parsing.
+pub(crate) fn is_libgen_http_url(url: &str) -> bool {
+    is_libgen(url)
+}
+
+fn libgen_base(url: &str) -> String {
+    let b = base_host(url);
+    if b.starts_with("http") && is_libgen(&b) {
+        b
+    } else {
+        LIBGEN_BASE.to_string()
+    }
+}
+
+fn libgen_query_url(base: &str, query: Option<&str>) -> String {
+    let base = base.trim_end_matches('/');
+    match query.map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => format!(
+            "{base}/index.php?req={enc}\
+             &columns%5B%5D=t&columns%5B%5D=a\
+             &objects%5B%5D=f&topics%5B%5D=l&res=25",
+            enc = urlencode(q),
+        ),
+        None => format!("{base}/index.php?req=&res=25&topics%5B%5D=l&objects%5B%5D=f"),
+    }
+}
+
+async fn libgen_browse(url: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = libgen_base(url);
+    let body = http_get(&libgen_query_url(&base, None)).await?;
+    Ok(parse_libgen_results(&base, &body, source_name, now))
+}
+
+async fn libgen_search(url: &str, query: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = libgen_base(url);
+    let body = http_get(&libgen_query_url(&base, Some(query))).await?;
+    Ok(parse_libgen_results(&base, &body, source_name, now))
+}
+
+fn parse_libgen_results(base: &str, body: &str, source_name: &str, now: i64) -> Vec<CatalogItem> {
+    if !body.contains("ads.php?md5=") {
+        return Vec::new();
+    }
+
+    let row_re   = regex::Regex::new(r"(?s)<tr[^>]*>(.*?)</tr>").unwrap();
+    let td_re    = regex::Regex::new(r"(?s)<td[^>]*>(.*?)</td>").unwrap();
+    let md5_re   = regex::Regex::new(r"ads\.php\?md5=([a-f0-9]{32})").unwrap();
+    let title_b  = regex::Regex::new(r"(?s)<b[^>]*>(.*?)</b>").unwrap();
+    let year_re  = regex::Regex::new(r"\b(19[5-9]\d|20[012]\d)\b").unwrap();
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cap in row_re.captures_iter(body) {
+        let row = &cap[1];
+        let md5 = match md5_re.captures(row) {
+            Some(c) => c[1].to_string(),
+            None => continue,
+        };
+        let id = format!("libgen:{md5}");
+        if !seen.insert(id.clone()) { continue; }
+
+        let cells: Vec<String> = td_re.captures_iter(row).map(|c| c[1].to_string()).collect();
+        if cells.len() < 8 { continue; }
+
+        let title = title_b
+            .captures(&cells[0])
+            .map(|c| html_unescape(&libgen_strip(&c[1])).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("Book {md5}"));
+
+        let author   = libgen_strip(&cells[1]).trim().to_string();
+        let year_raw = libgen_strip(&cells[3]);
+        let year     = year_re.find(&year_raw).and_then(|m| m.as_str().parse::<i64>().ok());
+        let language = libgen_strip(&cells[4]).trim().to_string();
+        let size_str = libgen_strip(&cells[6]).trim().to_string();
+        let format   = if cells.len() > 7 {
+            libgen_strip(&cells[7]).trim().to_uppercase()
+        } else { String::new() };
+
+        let mut bits = vec!["LibGen".to_string()];
+        if !format.is_empty()    { bits.push(format.clone()); }
+        if !size_str.is_empty()  { bits.push(size_str); }
+        if !language.is_empty()  { bits.push(language); }
+        if !author.is_empty()    { bits.push(author); }
+        let description = Some(bits.join(" · "));
+
+        let detail_url = format!("{}/ads.php?md5={md5}", base.trim_end_matches('/'));
+
+        out.push(CatalogItem {
+            id,
+            category: "books".to_string(),
+            title,
+            // Detail URL — resolved to the direct file URL by
+            // `libgen_resolve_direct_url` before the HTTP download.
+            magnet: detail_url,
+            size_bytes: 0,
+            seeders: 0,
+            leechers: 0,
+            source: source_name.to_string(),
+            added_at: now,
+            files: None,
+            poster: None,
+            description,
+            year,
+        });
+    }
+    out
+}
+
+fn libgen_strip(s: &str) -> String {
+    let re = regex::Regex::new(r"(?s)<[^>]+>").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
+/// Build a UA-spoofing reqwest client suitable for AA / LibGen detail pages.
+fn book_dl_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(BOOK_DL_UA)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build book-download client")
+}
+
+/// Given a LibGen `ads.php?md5=<hash>` URL, fetch the page and pull the
+/// `get.php?md5=&key=` direct-download URL out of the HTML. Returns `None`
+/// if the page isn't reachable or doesn't expose the link.
+pub(crate) async fn libgen_resolve_direct_url(detail_url: &str) -> Option<String> {
+    let client = book_dl_client().ok()?;
+    let resp = client.get(detail_url).send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let body = resp.text().await.ok()?;
+    let re = regex::Regex::new(r#"href="(get\.php\?md5=[a-f0-9]{32}&key=[A-Za-z0-9]+)""#).ok()?;
+    let path = re.captures(&body)?.get(1)?.as_str().to_string();
+    let base = base_host(detail_url);
+    let base = if base.starts_with("http") { base } else { LIBGEN_BASE.to_string() };
+    Some(format!("{}/{}", base.trim_end_matches('/'), path))
+}
+
+/// Public so lib.rs can detect Anna's Archive URLs without re-implementing host parsing.
+pub(crate) fn is_annas_http_url(url: &str) -> bool {
+    is_annas(url)
+}
+
+/// Given an Anna's Archive `/md5/<hash>` URL, fetch the detail page and try
+/// to find a direct download mirror we can pull bytes from without opening a
+/// browser. AA detail pages embed a `Download from libgen.li` button whose
+/// href points at LibGen's `ads.php?md5=...` — once we find it we hand it to
+/// `libgen_resolve_direct_url` to finish the resolution.
+pub(crate) async fn annas_resolve_direct_url(detail_url: &str) -> Option<String> {
+    let client = book_dl_client().ok()?;
+    let resp = client.get(detail_url).send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let body = resp.text().await.ok()?;
+
+    // 1) Prefer a libgen.li / libgen.is mirror link if one is present.
+    let lg_re = regex::Regex::new(
+        r#"href="(https?://(?:libgen\.[a-z]+|library\.lol)/[^"]*ads\.php\?md5=[a-f0-9]{32}[^"]*)""#,
+    ).ok()?;
+    if let Some(c) = lg_re.captures(&body) {
+        let lg_url = html_unescape(&c[1]);
+        if let Some(direct) = libgen_resolve_direct_url(&lg_url).await {
+            return Some(direct);
+        }
+    }
+
+    // 2) AA also publishes its own "slow partner" downloads at /slow_download/<md5>/0/0.
+    // Many partners 302 to a real file; a few render an HTML waiting page that the
+    // download path will reject. We try one and let download_http_file decide.
+    let md5_re = regex::Regex::new(r"/md5/([a-f0-9]{32})").ok()?;
+    if let Some(c) = md5_re.captures(detail_url) {
+        let md5 = &c[1];
+        let base = base_host(detail_url);
+        let base = if base.starts_with("http") { base } else { ANNAS_BASE.to_string() };
+        return Some(format!("{}/slow_download/{}/0/0", base.trim_end_matches('/'), md5));
+    }
+
+    None
 }
 
 fn looks_like_zlib_bot_gate(body: &str) -> bool {
