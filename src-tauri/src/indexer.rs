@@ -16,6 +16,8 @@ use crate::catalog::CatalogItem;
 /// TPB mirror URL is made to work by falling back to apibay.
 const APIBAY: &str = "https://apibay.org";
 const ANNAS_BASE: &str = "https://annas-archive.cc";
+const INTERNET_ARCHIVE_BASE: &str = "https://archive.org";
+const ROMSGAMES_BASE: &str = "https://www.romsgames.net";
 
 /// Does this URL point at a Pirate Bay mirror (so the apibay JSON API is the real source)?
 fn is_tpb(url: &str) -> bool {
@@ -32,6 +34,16 @@ fn is_zlib(url: &str) -> bool {
     u.contains("z-library") || u.contains("zlibrary") || u.contains("z-lib") || u.contains("singlelogin")
 }
 
+fn is_internet_archive(url: &str) -> bool {
+    let u = url.to_lowercase();
+    u.contains("archive.org") && !u.contains("web.archive.org")
+}
+
+fn is_romsgames(url: &str) -> bool {
+    let u = url.to_lowercase();
+    u.contains("romsgames.net") || u.contains("downloadroms.io")
+}
+
 pub async fn run_source(kind: &str, url: &str, source_name: &str, now_ms: i64) -> Result<Vec<CatalogItem>> {
     match kind {
         "torznab" => torznab(url, source_name, now_ms).await,
@@ -45,7 +57,13 @@ pub async fn run_source(kind: &str, url: &str, source_name: &str, now_ms: i64) -
         _ => {
             // SubsPlease/Nyaa ship structured APIs, not server-rendered magnets — route
             // them to their adapters even if the source wasn't explicitly typed "adapter".
-            if is_subsplease(url) || is_nyaa(url) || is_annas(url) || is_zlib(url) {
+            if is_subsplease(url)
+                || is_nyaa(url)
+                || is_annas(url)
+                || is_zlib(url)
+                || is_internet_archive(url)
+                || is_romsgames(url)
+            {
                 return adapter_source(url, source_name, now_ms).await;
             }
             let body = http_get(url).await?;
@@ -211,6 +229,12 @@ async fn adapter_source(url: &str, source_name: &str, now: i64) -> Result<Vec<Ca
     }
     if is_zlib(url) {
         return zlib_browse(url, source_name, now).await;
+    }
+    if is_internet_archive(url) {
+        return internet_archive_browse(url, source_name, now).await;
+    }
+    if is_romsgames(url) {
+        return romsgames_browse(url, source_name, now).await;
     }
     if is_subsplease(url) {
         return subsplease_browse(url, source_name, now).await;
@@ -609,6 +633,12 @@ pub async fn search_source(
     if is_zlib(url) {
         return zlib_search(url, q, source_name, now).await;
     }
+    if is_internet_archive(url) {
+        return internet_archive_search(url, q, source_name, now).await;
+    }
+    if is_romsgames(url) {
+        return romsgames_search(url, q, source_name, now).await;
+    }
     if is_subsplease(url) {
         return subsplease_search(url, q, source_name, now).await;
     }
@@ -668,6 +698,338 @@ fn child_text(node: &roxmltree::Node, name: &str) -> Option<String> {
         .and_then(|c| c.text())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+// ---- Internet Archive + RomsGames game adapters ----
+
+fn internet_archive_base(url: &str) -> String {
+    let b = base_host(url);
+    if b.starts_with("http") && is_internet_archive(&b) {
+        b
+    } else {
+        INTERNET_ARCHIVE_BASE.to_string()
+    }
+}
+
+const IA_GAME_FILTER: &str = "mediatype:software AND (subject:(game OR games OR rom OR arcade OR emulator) OR collection:(consolelivingroom OR softwarelibrary OR softwarelibrary_console OR psxgames))";
+
+fn internet_archive_query_url(base: &str, query: Option<&str>, page: usize) -> String {
+    let q = query
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(|q| format!("({q}) AND ({IA_GAME_FILTER})"))
+        .unwrap_or_else(|| IA_GAME_FILTER.to_string());
+
+    format!(
+        "{}/advancedsearch.php?q={}&fl[]=identifier&fl[]=title&fl[]=year&fl[]=date&fl[]=creator&fl[]=subject&rows=60&page={}&output=json&sort[]=downloads%20desc",
+        base.trim_end_matches('/'),
+        urlencode(&q),
+        page.max(1),
+    )
+}
+
+fn value_first_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = html_unescape(s.trim());
+            if t.is_empty() { None } else { Some(t) }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Array(a) => a.iter().find_map(value_first_string),
+        _ => None,
+    }
+}
+
+fn value_strings(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(value_first_string).collect(),
+        Some(other) => value_first_string(other).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+fn year_from_any_text(s: &str) -> Option<i64> {
+    let re = regex::Regex::new(r"(19|20)\d{2}").ok()?;
+    re.find(s)?.as_str().parse().ok()
+}
+
+fn internet_archive_doc_year(doc: &serde_json::Value) -> Option<i64> {
+    doc.get("year")
+        .and_then(value_first_string)
+        .and_then(|y| year_from_any_text(&y))
+        .or_else(|| {
+            doc.get("date")
+                .and_then(value_first_string)
+                .and_then(|d| year_from_any_text(&d))
+        })
+}
+
+fn parse_internet_archive_results(base: &str, body: &str, source_name: &str, now: i64) -> Vec<CatalogItem> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(docs) = val
+        .get("response")
+        .and_then(|r| r.get("docs"))
+        .and_then(|d| d.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for doc in docs {
+        let Some(identifier) = doc.get("identifier").and_then(value_first_string) else {
+            continue;
+        };
+        let id = format!("ia:{}", identifier.to_lowercase());
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let title = doc
+            .get("title")
+            .and_then(value_first_string)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| identifier.clone());
+
+        let details_url = format!(
+            "{}/details/{}",
+            base.trim_end_matches('/'),
+            urlencode(&identifier)
+        );
+        let poster = Some(format!(
+            "{}/services/img/{}",
+            base.trim_end_matches('/'),
+            urlencode(&identifier)
+        ));
+
+        let creator = doc.get("creator").and_then(value_first_string);
+        let subjects: Vec<String> = value_strings(doc.get("subject")).into_iter().take(3).collect();
+        let mut meta = vec!["Internet Archive".to_string()];
+        if let Some(c) = creator {
+            meta.push(c);
+        }
+        if !subjects.is_empty() {
+            meta.push(subjects.join(", "));
+        }
+
+        out.push(CatalogItem {
+            id,
+            category: "software".to_string(),
+            title: title.clone(),
+            // For web sources, this is a detail URL opened in-app (not a torrent magnet).
+            magnet: details_url,
+            size_bytes: 0,
+            seeders: 0,
+            leechers: 0,
+            source: source_name.to_string(),
+            added_at: now,
+            files: None,
+            poster,
+            description: Some(meta.join(" · ")),
+            year: internet_archive_doc_year(doc).or_else(|| guess_year(&title)),
+        });
+    }
+    out
+}
+
+async fn internet_archive_search(url: &str, query: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = internet_archive_base(url);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for page in 1..=2 {
+        let endpoint = internet_archive_query_url(&base, Some(query), page);
+        let body = http_get(&endpoint).await?;
+        for it in parse_internet_archive_results(&base, &body, source_name, now) {
+            if seen.insert(it.id.clone()) {
+                out.push(it);
+            }
+        }
+        if out.len() >= 80 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn internet_archive_browse(url: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = internet_archive_base(url);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for page in 1..=2 {
+        let endpoint = internet_archive_query_url(&base, None, page);
+        let body = http_get(&endpoint).await?;
+        for it in parse_internet_archive_results(&base, &body, source_name, now) {
+            if seen.insert(it.id.clone()) {
+                out.push(it);
+            }
+        }
+        if out.len() >= 80 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn romsgames_base(url: &str) -> String {
+    let b = base_host(url);
+    if b.starts_with("http") && is_romsgames(&b) {
+        b
+    } else {
+        ROMSGAMES_BASE.to_string()
+    }
+}
+
+fn title_case_slug(slug: &str) -> String {
+    slug.split('-')
+        .filter(|s| !s.trim().is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_romsgames_results(base: &str, body: &str, source_name: &str, now: i64) -> Vec<CatalogItem> {
+    if !body.contains("-rom-") {
+        return Vec::new();
+    }
+
+    let card_re = regex::Regex::new(
+        r#"(?s)<a href="([^"]*?-rom-[^"]+?/?)"[^>]*>.*?<img[^>]+src="([^"]+)"[^>]*alt="([^"]*)"[^>]*>.*?<div[^>]*>\s*([^<]+?)\s*</div>"#,
+    )
+    .unwrap();
+    let platform_re = regex::Regex::new(r#"^/?([a-z0-9-]+)-rom-"#).unwrap();
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for cap in card_re.captures_iter(body) {
+        let href = absolute_url(base, &html_unescape(cap.get(1).map(|m| m.as_str()).unwrap_or("")));
+        let slug = href
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        if slug.is_empty() {
+            continue;
+        }
+        let id = format!("romsgames:{slug}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let alt = html_unescape(cap.get(3).map(|m| m.as_str()).unwrap_or(""));
+        let card_title = html_unescape(cap.get(4).map(|m| m.as_str()).unwrap_or(""));
+        let title = if card_title.trim().is_empty() {
+            alt.trim().to_string()
+        } else {
+            card_title.trim().to_string()
+        };
+        if title.is_empty() {
+            continue;
+        }
+
+        let platform = platform_re
+            .captures(&slug)
+            .and_then(|c| c.get(1).map(|m| title_case_slug(m.as_str())));
+        let description = Some(match platform {
+            Some(p) => format!("RomsGames · {p}"),
+            None => "RomsGames".to_string(),
+        });
+
+        let poster = Some(absolute_url(
+            base,
+            &html_unescape(cap.get(2).map(|m| m.as_str()).unwrap_or("")),
+        ))
+        .filter(|u| !u.is_empty() && !u.contains("/image/no-cover"));
+
+        out.push(CatalogItem {
+            id,
+            category: "software".to_string(),
+            title: title.clone(),
+            // This points to the detail page (opened in-app), which then serves the save action.
+            magnet: href,
+            size_bytes: 0,
+            seeders: 0,
+            leechers: 0,
+            source: source_name.to_string(),
+            added_at: now,
+            files: None,
+            poster,
+            description,
+            year: guess_year(&title),
+        });
+    }
+    out
+}
+
+async fn romsgames_search(url: &str, query: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = romsgames_base(url);
+    let q = urlencode(query);
+    for endpoint in [
+        format!("{}/search/?q={q}", base.trim_end_matches('/')),
+        format!("{}/?s={q}", base.trim_end_matches('/')),
+    ] {
+        if let Ok(body) = http_get(&endpoint).await {
+            let items = parse_romsgames_results(&base, &body, source_name, now);
+            if !items.is_empty() {
+                return Ok(items);
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+async fn romsgames_browse(url: &str, source_name: &str, now: i64) -> Result<Vec<CatalogItem>> {
+    let base = romsgames_base(url);
+    let url_l = url.to_lowercase();
+    let base_l = base.to_lowercase();
+
+    let mut candidates = vec![url.to_string()];
+    let rootish = url_l == base_l
+        || url_l == format!("{base_l}/")
+        || url_l.ends_with("/roms/")
+        || url_l.ends_with("romsgames.net")
+        || url_l.ends_with("romsgames.net/")
+        || url_l.ends_with("downloadroms.io")
+        || url_l.ends_with("downloadroms.io/");
+    if rootish {
+        candidates.extend([
+            format!("{}/roms/playstation/", base.trim_end_matches('/')),
+            format!("{}/roms/nintendo-ds/", base.trim_end_matches('/')),
+            format!("{}/roms/gameboy-advance/", base.trim_end_matches('/')),
+            format!("{}/roms/super-nintendo/", base.trim_end_matches('/')),
+        ]);
+    }
+
+    let mut tried = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for endpoint in candidates {
+        let key = endpoint.trim_end_matches('/').to_lowercase();
+        if !tried.insert(key) {
+            continue;
+        }
+        if let Ok(body) = http_get(&endpoint).await {
+            for it in parse_romsgames_results(&base, &body, source_name, now) {
+                if seen.insert(it.id.clone()) {
+                    out.push(it);
+                }
+            }
+            if out.len() >= 80 {
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---- shared magnet/title helpers ----
@@ -1745,4 +2107,66 @@ mod nyaa_tests {
         let latest = nyaa_browse("https://nyaa.si", "Nyaa", 0).await.unwrap();
         assert!(!latest.is_empty(), "latest returned results");
     }
+}
+
+#[cfg(test)]
+mod internet_archive_tests {
+        use super::*;
+
+        const SAMPLE: &str = r#"{
+            "response": {
+                "docs": [
+                    {
+                        "identifier": "psx_crash_bandicoot",
+                        "title": "Crash Bandicoot (PSX)",
+                        "year": "1996",
+                        "creator": "Naughty Dog",
+                        "subject": ["games", "platformer", "playstation"]
+                    }
+                ]
+            }
+        }"#;
+
+        #[test]
+        fn parses_archive_search_doc_into_game_item() {
+                let items = parse_internet_archive_results(INTERNET_ARCHIVE_BASE, SAMPLE, "Archive", 1000);
+                assert_eq!(items.len(), 1);
+
+                let it = &items[0];
+                assert_eq!(it.id, "ia:psx_crash_bandicoot");
+                assert_eq!(it.category, "software");
+                assert_eq!(it.title, "Crash Bandicoot (PSX)");
+                assert_eq!(it.magnet, "https://archive.org/details/psx_crash_bandicoot");
+                assert_eq!(it.poster.as_deref(), Some("https://archive.org/services/img/psx_crash_bandicoot"));
+                assert_eq!(it.year, Some(1996));
+                assert!(it.description.as_deref().unwrap_or("").contains("Internet Archive"));
+        }
+}
+
+#[cfg(test)]
+mod romsgames_tests {
+        use super::*;
+
+        const SAMPLE: &str = r#"
+<div class="grid gap-6">
+    <a href="/playstation-rom-crash-bandicoot-1/" class="relative p-2">
+        <img src="https://cache.downloadroms.io/static/abc/image.jpeg" alt="Crash Bandicoot">
+        <div>Crash Bandicoot</div>
+    </a>
+</div>
+"#;
+
+        #[test]
+        fn parses_romsgames_card_into_game_item() {
+                let items = parse_romsgames_results(ROMSGAMES_BASE, SAMPLE, "RomsGames", 1000);
+                assert_eq!(items.len(), 1);
+
+                let it = &items[0];
+                assert_eq!(it.id, "romsgames:playstation-rom-crash-bandicoot-1");
+                assert_eq!(it.category, "software");
+                assert_eq!(it.title, "Crash Bandicoot");
+                assert_eq!(it.magnet, "https://www.romsgames.net/playstation-rom-crash-bandicoot-1/");
+                assert_eq!(it.poster.as_deref(), Some("https://cache.downloadroms.io/static/abc/image.jpeg"));
+                assert!(it.description.as_deref().unwrap_or("").contains("RomsGames"));
+        }
 }

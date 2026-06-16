@@ -5,9 +5,9 @@ import path from "path";
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
-// Base UI is consumed as `file:../../Libs/base` (TS source), so Vite needs to be
-// allowed to read it and must dedupe React to a single instance.
-const baseDir = path.resolve(__dirname, "../../Libs/base");
+// Base UI ships as TS source, vendored into node_modules via `file:vendor/base.tgz`
+// (so the app builds on any machine without the monorepo). It lives under the project
+// root, so no extra fs.allow is needed — but React must still dedupe to one instance.
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -42,9 +42,9 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
-    // 4. allow serving the linked Base design-system source from outside the project root
+    // 4. serve from the project root (Base now lives in node_modules, inside it)
     fs: {
-      allow: [path.resolve(__dirname), baseDir],
+      allow: [path.resolve(__dirname)],
     },
   },
 }));

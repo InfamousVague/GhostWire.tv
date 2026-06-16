@@ -146,7 +146,14 @@ function relayPosterUrl(title: string, kind?: string): string | undefined {
   if (!clean) return undefined;
   const t = (kind ?? "").toLowerCase();
   if (t === "music") return undefined; // album art is resolved separately (iTunes/embedded)
-  const type = t === "anime" ? "anime" : t === "show" || t === "tv" || t === "series" ? "tv" : "movie";
+  const type =
+    t === "anime"
+      ? "anime"
+      : t === "game"
+        ? "game"
+        : t === "show" || t === "tv" || t === "series"
+          ? "tv"
+          : "movie";
   return `${POSTER_RELAY}?type=${type}&title=${encodeURIComponent(clean)}`;
 }
 

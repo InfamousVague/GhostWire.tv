@@ -416,7 +416,17 @@ export function Search({
             <div className="empty">
               <div className="empty-inner">
                 <h3>No matches</h3>
-                <p>No results match these filters — try “Any format” or a different category.</p>
+                {tab !== "all" ? (
+                  <>
+                    <p>
+                      No <b>{DISCOVER_TABS.find((t) => t.id === tab)?.label}</b> results for “{query}” — the category
+                      filter is hiding {results.length} other result{results.length === 1 ? "" : "s"}.
+                    </p>
+                    <Button variant="secondary" shape="pill" onClick={() => setTab("all")}>Show all results</Button>
+                  </>
+                ) : (
+                  <p>No results match these filters — try “Any format” or a different category.</p>
+                )}
               </div>
             </div>
           ) : (

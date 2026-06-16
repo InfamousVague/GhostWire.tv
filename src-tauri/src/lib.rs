@@ -2381,7 +2381,12 @@ async fn poster_candidates(title: String, kind: Option<String>) -> Vec<String> {
     else {
         return Vec::new();
     };
-    posters::candidates(&client, &title, kind.as_deref().unwrap_or("movie")).await
+    let inferred = kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| posters::guess_kind(&title));
+    posters::candidates(&client, &title, inferred).await
 }
 
 /// Set a manual poster for everything matching `title`. Caches the chosen image and

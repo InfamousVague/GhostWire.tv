@@ -8,10 +8,11 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "vendor:base": "npm pack ../../Libs/base --pack-destination vendor --silent && mv -f vendor/mattmattmattmatt-base-*.tgz vendor/base.tgz && rm -rf node_modules/@mattmattmattmatt/base && npm install"
   },
   "dependencies": {
-    "@mattmattmattmatt/base": "file:../../Libs/base",
+    "@mattmattmattmatt/base": "file:vendor/base.tgz",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",

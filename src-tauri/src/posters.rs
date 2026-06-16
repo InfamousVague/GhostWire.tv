@@ -1,6 +1,7 @@
 //! Keyless-first cover-art lookup so posters appear without the user adding any
 //! API key. IMDb's public suggestion endpoint returns posters for commercial
-//! movies and TV; iTunes covers music albums. TMDB/OMDb refine when keys exist.
+//! movies and TV; iTunes covers music albums. TMDB/OMDb refine when keys exist,
+//! and games can use RomsGames/relay box art.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -141,11 +142,88 @@ pub async fn itunes_album(client: &reqwest::Client, title: &str) -> Result<Optio
     Ok(None)
 }
 
+fn absolute_game_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return url.to_string();
+    }
+    if url.starts_with("//") {
+        return format!("https:{url}");
+    }
+    if url.starts_with('/') {
+        return format!("https://www.romsgames.net{url}");
+    }
+    format!("https://www.romsgames.net/{url}")
+}
+
+/// Best-effort game box art from RomsGames search cards (keyless, no API).
+async fn romsgames_box_art(client: &reqwest::Client, title: &str) -> Result<Option<String>> {
+    let want = normalize(&clean_for_query(title, "game"));
+    if want.is_empty() {
+        return Ok(None);
+    }
+
+    let mut search = reqwest::Url::parse("https://www.romsgames.net/search/")?;
+    {
+        let mut qp = search.query_pairs_mut();
+        qp.append_pair("q", title.trim());
+    }
+    let body = client
+        .get(search)
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    let card_re = regex::Regex::new(
+        r#"(?s)<a href="([^"]*?-rom-[^"]+?/?)"[^>]*>.*?<img[^>]+src="([^"]+)"[^>]*alt="([^"]*)""#,
+    )?;
+    let mut best: Option<(i32, String)> = None;
+    for cap in card_re.captures_iter(&body) {
+        let href = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let img = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        if img.is_empty() || img.contains("/image/no-cover") {
+            continue;
+        }
+        let alt = normalize(cap.get(3).map(|m| m.as_str()).unwrap_or(""));
+        let slug_guess = href
+            .trim_matches('/')
+            .rsplit('/')
+            .next()
+            .map(|s| s.replace('-', " "))
+            .unwrap_or_default();
+        let cand_title = if alt.is_empty() { normalize(&slug_guess) } else { alt };
+        let score = title_score(&want, &cand_title);
+        if score == 0 {
+            continue;
+        }
+        let art = absolute_game_url(img);
+        if best.as_ref().map_or(true, |(b, _)| score > *b) {
+            best = Some((score, art));
+        }
+    }
+    Ok(best.map(|(_, u)| u))
+}
+
 /// Several poster candidates for a title (IMDb suggestion results + iTunes), for the
 /// manual "replace poster" picker. Keyless.
 pub async fn candidates(client: &reqwest::Client, title: &str, kind: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let want = normalize(title);
+
+    if kind == "game" {
+        if let Ok(Some(u)) = romsgames_box_art(client, title).await {
+            out.push(u);
+        }
+        let relay = relay_poster_url("game", title, year_from_title(title));
+        if !out.contains(&relay) {
+            out.push(relay);
+        }
+        out.truncate(18);
+        return out;
+    }
+
     let Some(first) = want.chars().next() else {
         return out;
     };
@@ -298,6 +376,7 @@ pub async fn fetch_featured(client: &reqwest::Client) -> anyhow::Result<Vec<Movi
 fn relay_poster_url(kind: &str, title: &str, year: Option<i64>) -> String {
     let typ = match kind {
         "anime" => "anime",
+        "game" => "game",
         "show" => "tv",
         _ => "movie",
     };
@@ -327,6 +406,13 @@ pub async fn find_poster(
 ) -> Option<String> {
     if kind == "music" {
         return itunes_album(client, title).await.ok().flatten();
+    }
+    // Games: scrape box art from RomsGames first, then ask the relay's game endpoint.
+    if kind == "game" {
+        if let Ok(Some(u)) = romsgames_box_art(client, title).await {
+            return Some(u);
+        }
+        return Some(relay_poster_url("game", title, year));
     }
     // Anime resolves best via AniList (through the relay's /poster?type=anime);
     // TMDB/OMDb are weak at anime, so route it to the relay regardless of keys.
@@ -459,12 +545,26 @@ fn is_anime(t: &str) -> bool {
         .any(|m| t.contains(m))
 }
 
-/// Guess the media kind from a release title (anime / TV markers / audio hints).
+fn is_game_title(t: &str) -> bool {
+    // Console/platform hints and common ROM/container extensions.
+    const HINTS: &[&str] = &[
+        "playstation", "nintendo", "xbox", "switch", "gamecube", "dreamcast", "atari",
+        "romset", "emulator", "psx", "psp", "ps2", "ps3", "ps4", "ps5", "gba", "nds",
+        "3ds", "snes", "n64", ".iso", ".chd", ".cue", ".bin", ".cso", ".nsp", ".xci",
+        ".gba", ".nds", ".3ds", ".cia", ".z64", ".n64", " rom ", " roms ",
+    ];
+    HINTS.iter().any(|h| t.contains(h))
+}
+
+/// Guess the media kind from a release title (anime / game / TV / audio hints).
 pub fn guess_kind(title: &str) -> &'static str {
     let t = title.to_lowercase();
     // Anime first — AniList (the relay's anime source) covers both films and series.
     if is_anime(&t) {
         return "anime";
+    }
+    if is_game_title(&t) {
+        return "game";
     }
     let is_tv = regex::Regex::new(r"\bs\d{1,2}\s?e\d{1,2}\b|\bs\d{1,2}\b|\bseason\s*\d|\bcomplete\b|\bepisode")
         .ok()
