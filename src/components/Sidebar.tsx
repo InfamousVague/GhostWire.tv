@@ -5,6 +5,7 @@ import { type MediaSectionId, type SectionSort } from "../lib/media";
 import { SETTINGS_TABS, type SettingsTab } from "../lib/settingsTabs";
 import { IS_IOS } from "../lib/platform";
 import { arrowDownUp, history, tag, trendingUp } from "../lib/icons";
+import { ExtensionViewSidebar, useExtViewHasSidebar } from "../ext/slots";
 
 // NavId is a superset of the content sections; this narrows it.
 const MEDIA: NavId[] = ["movies", "tvshows", "music", "books", "games"];
@@ -45,10 +46,13 @@ interface SidebarProps {
 
 export function Sidebar(props: SidebarProps) {
   const { collapsed, section } = props;
+  const hasExtSidebar = useExtViewHasSidebar(section);
   return (
     <aside className={`sidebar${collapsed ? " is-collapsed" : ""}`}>
       <div className="sidebar-inner">
-        {section === "discover" ? (
+        {hasExtSidebar ? (
+          <ExtensionViewSidebar id={section} />
+        ) : section === "discover" ? (
           <DiscoverFilters {...props} />
         ) : section === "music" ? (
           <MusicSidebar {...props} />

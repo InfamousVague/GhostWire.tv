@@ -32,6 +32,7 @@ import {
   socialSearch,
   socialStatus,
   socialUnfollow,
+  seedingShares,
   type FriendPresence,
   type ShareItem,
   type SocialStatus,
@@ -546,6 +547,21 @@ function MySharesPanel({
   const [q, setQ] = useState("");
   const [sel, setSel] = useState<Set<string>>(new Set());
 
+  // The album cover needs (album, artist), which a share's display title (a filename) doesn't
+  // carry. The backend reads those tags straight from each seeded file — fetch them and key by
+  // infohash so audio shares resolve the right cover instead of a gradient placeholder.
+  const [tagsByHash, setTagsByHash] = useState<Map<string, ShareItem>>(new Map());
+  useEffect(() => {
+    let alive = true;
+    seedingShares()
+      .then((shares) => {
+        if (!alive) return;
+        setTagsByHash(new Map(shares.map((s) => [s.infohash.toLowerCase(), s])));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [myShares.length]);
+
   const rows = useMemo(() => {
     const needle = q.trim().toLowerCase();
     const list = needle ? myShares.filter((s) => s.title.toLowerCase().includes(needle)) : myShares;
@@ -623,7 +639,8 @@ function MySharesPanel({
           {rows.map((s) => {
             const cat = guessShareCategory(s.title);
             const ty = SHARE_TYPE[cat];
-            const cover = cat === "audio" ? relayMusicUrl(s.title) : undefined;
+            const tags = tagsByHash.get(s.id.toLowerCase());
+            const cover = cat === "audio" ? relayMusicUrl(tags?.album || s.title, tags?.artist) : undefined;
             const clean = cleanRelease(s.title) || s.title;
             const hue = hueFromString(s.title);
             const checked = sel.has(s.id);

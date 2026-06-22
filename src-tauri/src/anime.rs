@@ -222,6 +222,12 @@ async fn jikan_search(client: &reqwest::Client, title: &str) -> Result<Option<An
 struct JikanEpisodesResp {
     #[serde(default)]
     data: Vec<JikanEp>,
+    pagination: Option<JikanEpPagination>,
+}
+#[derive(Deserialize)]
+struct JikanEpPagination {
+    #[serde(default)]
+    has_next_page: bool,
 }
 #[derive(Deserialize)]
 struct JikanEp {
@@ -230,26 +236,39 @@ struct JikanEp {
     aired: Option<String>,
 }
 
-/// Episode titles for a MAL id (first page — up to ~100; enough for current-season
-/// and most series, with longer runs falling back to bare numbers on the client).
+/// Full episode-title list for a MAL id. Jikan paginates ~100 episodes per page, so walk pages
+/// until the API reports no more (bounded) — long-runners (One Piece 1000+, Naruto, Bleach) need
+/// every page for an accurate list, which the old single-page fetch truncated at ~100. A small
+/// inter-page delay keeps us under Jikan's ~3 req/s rate limit so bursts don't trip 429s.
 async fn jikan_episodes(client: &reqwest::Client, mal_id: i64) -> Result<Vec<AnimeEpisode>> {
-    let resp: JikanEpisodesResp = client
-        .get(format!("https://api.jikan.moe/v4/anime/{mal_id}/episodes"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(resp
-        .data
-        .into_iter()
-        .enumerate()
-        .map(|(i, e)| AnimeEpisode {
-            number: e.mal_id.unwrap_or((i as i64) + 1),
-            title: e.title.filter(|t| !t.is_empty()),
-            airdate: e.aired.and_then(|a| a.get(0..10).map(str::to_string)),
-        })
-        .collect())
+    const MAX_PAGES: u32 = 20; // ~2000 episodes — covers even One Piece while bounding runaway/429s
+    let mut out: Vec<AnimeEpisode> = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let resp: JikanEpisodesResp = client
+            .get(format!("https://api.jikan.moe/v4/anime/{mal_id}/episodes"))
+            .query(&[("page", page.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        for e in resp.data {
+            let number = e.mal_id.unwrap_or((out.len() as i64) + 1);
+            out.push(AnimeEpisode {
+                number,
+                title: e.title.filter(|t| !t.is_empty()),
+                airdate: e.aired.and_then(|a| a.get(0..10).map(str::to_string)),
+            });
+        }
+        let more = resp.pagination.map(|p| p.has_next_page).unwrap_or(false);
+        if !more || page >= MAX_PAGES {
+            break;
+        }
+        page += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    Ok(out)
 }
 
 /// Look up one anime by title (AniList → Jikan fallback) + its episode list. Powers
@@ -265,7 +284,63 @@ pub async fn anime_detail(client: &reqwest::Client, title: &str) -> Option<Anime
             episode_list = eps;
         }
     }
+    // Fallback so the series builder always has a complete, pickable list: when no per-episode
+    // titles were available (AniList-only id, or Jikan exposed none) but the total count is known,
+    // synthesize bare episodes 1..N.
+    if episode_list.is_empty() {
+        if let Some(n) = info.episodes {
+            if (1..=5000).contains(&n) {
+                episode_list = (1..=n)
+                    .map(|number| AnimeEpisode { number, title: None, airdate: None })
+                    .collect();
+            }
+        }
+    }
     Some(AnimeDetail { info, episode_list })
+}
+
+/// Search anime by title returning MULTIPLE candidates — the series-builder's disambiguation step
+/// (the user types "frieren" and picks the right show). AniList first (richest, best-match sort),
+/// Jikan as a fallback. Keyless; degrades to an empty list on any error.
+pub async fn anime_search(client: &reqwest::Client, query: &str) -> Vec<AnimeItem> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    if let Ok(list) = anilist_page_search(client, query).await {
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    match client
+        .get("https://api.jikan.moe/v4/anime")
+        .query(&[("q", query), ("limit", "12"), ("sfw", "true")])
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(r) => r
+            .json::<JikanList>()
+            .await
+            .map(|l| l.data.into_iter().filter_map(jikan_map).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// AniList page search (best matches first) → up to 12 candidates.
+async fn anilist_page_search(client: &reqwest::Client, query: &str) -> Result<Vec<AnimeItem>> {
+    let gql = r#"query($q:String,$n:Int){Page(perPage:$n){media(search:$q,type:ANIME,sort:SEARCH_MATCH,isAdult:false){id idMal title{romaji english} averageScore seasonYear episodes format status genres coverImage{large} description(asHtml:false) trailer{id site}}}}"#;
+    let body = serde_json::json!({ "query": gql, "variables": { "q": query, "n": 12 } });
+    let resp: AniResp = client
+        .post("https://graphql.anilist.co")
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let media = resp.data.and_then(|d| d.page).map(|p| p.media).unwrap_or_default();
+    Ok(media.into_iter().filter_map(ani_map).collect())
 }
 
 // ============================ Jikan (MyAnimeList) ============================

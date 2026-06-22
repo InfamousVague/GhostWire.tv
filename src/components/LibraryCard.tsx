@@ -5,7 +5,8 @@ import { useIsShared, useShareControls } from "../ipc/shares";
 import { useAppContextMenu, type MenuAction } from "./ContextMenu";
 import { hueFromString } from "../lib/catalog";
 import { formatBytes } from "../lib/format";
-import { award, circleCheck, circlePlay, clapperboard, copy, download as downloadIcon, star, upload } from "../lib/icons";
+import { award, circleCheck, circlePlay, clapperboard, clock, copy, download as downloadIcon, star, upload } from "../lib/icons";
+import { addToWatchLater, isInWatchLater } from "../lib/watchLater";
 
 /** Parse the JSON-encoded tag array the backend stores; tolerant of nulls. */
 function parseTags(tags?: string | null): string[] {
@@ -46,6 +47,7 @@ function LibraryCardImpl({
     if (!openMenu) return;
     const actions: MenuAction[] = [{ label: "Play", icon: circlePlay, onSelect: onPlay }];
     if (onQueue) actions.push({ label: "Add to downloads", icon: downloadIcon, onSelect: onQueue });
+    if (!isInWatchLater(title)) actions.push({ label: "Add to Watch Later", icon: clock, onSelect: () => addToWatchLater({ title, magnet: item.magnet }) });
     actions.push(
       shared
         ? { label: "Stop sharing", icon: upload, divider: true, onSelect: () => stopSharing(item.id) }

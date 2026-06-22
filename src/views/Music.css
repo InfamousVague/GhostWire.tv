@@ -183,50 +183,132 @@
   font-size: 13px;
 }
 
-/* ---- Genre tiles ---- */
+/* ---- Genre tiles ----
+   GhostWire's own take: a moody dark-glass card per genre (not a flat Spotify colour block),
+   coloured by a neon glow + an equalizer-bar motif keyed to the genre's hue (--g-hue). */
 .genre-tiles {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
 }
 .genre-tile {
+  --g1: hsl(var(--g-hue) 85% 62%);
+  --g2: hsl(calc(var(--g-hue) + 42) 78% 52%);
   position: relative;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  gap: 2px;
-  height: 96px;
+  gap: 3px;
+  height: 104px;
   padding: 14px 16px;
   overflow: hidden;
-  border: none;
-  border-radius: var(--radius-md);
+  border: 1px solid var(--gg-glass-brd);
+  border-radius: 16px;
   color: #fff;
   text-align: left;
   cursor: pointer;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3);
-  transition: transform 120ms ease, box-shadow 120ms ease;
+  isolation: isolate;
+  /* Strong colour glow from the top-right corner fading to near-black at the bottom-left,
+     where the label sits — so each genre reads by colour but text stays legible. */
+  background:
+    radial-gradient(135% 130% at 100% -12%, color-mix(in srgb, var(--g1) 60%, transparent) 0%, transparent 60%),
+    linear-gradient(155deg, color-mix(in srgb, var(--g2) 26%, #121218) 0%, #0e0e13 78%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 22px rgba(0, 0, 0, 0.38);
+  transition: transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease;
 }
 .genre-tile:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.4);
+  transform: translateY(-3px);
+  border-color: color-mix(in srgb, var(--g1) 55%, var(--gg-glass-brd));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 16px 32px rgba(0, 0, 0, 0.5),
+    0 0 28px color-mix(in srgb, var(--g1) 28%, transparent);
+}
+/* The glowing colour orb behind the eq bars. */
+.genre-tile-glow {
+  position: absolute;
+  top: -34px;
+  right: -26px;
+  width: 130px;
+  height: 130px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--g1) 0%, transparent 66%);
+  opacity: 0.55;
+  pointer-events: none;
+  z-index: 0;
+}
+/* Brand halftone dot grid (matches .app-halftone), tinted by the genre, in the top-right. */
+.genre-tile-halftone {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 116px;
+  height: 116px;
+  pointer-events: none;
+  z-index: 0;
+  background: var(--g1);
+  -webkit-mask-image:
+    radial-gradient(circle at center, #000 0 0.9px, transparent 1.4px),
+    radial-gradient(120% 120% at 100% 0%, #000 6%, transparent 70%);
+  mask-image:
+    radial-gradient(circle at center, #000 0 0.9px, transparent 1.4px),
+    radial-gradient(120% 120% at 100% 0%, #000 6%, transparent 70%);
+  -webkit-mask-size: 8px 8px, 100% 100%;
+  mask-size: 8px 8px, 100% 100%;
+  -webkit-mask-position: top right, top right;
+  mask-position: top right, top right;
+  -webkit-mask-repeat: repeat, no-repeat;
+  mask-repeat: repeat, no-repeat;
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
+  opacity: 0.22;
+}
+/* Equalizer-bar motif — GhostWire's audio identity, tinted to the genre. */
+.genre-tile-bars {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 28px;
+  z-index: 1;
+  pointer-events: none;
+}
+.genre-tile-bars i {
+  width: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to top, var(--g2), var(--g1));
+  transform-origin: bottom;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--g1) 45%, transparent);
+}
+.genre-tile-bars i:nth-child(1) { height: 42%; }
+.genre-tile-bars i:nth-child(2) { height: 78%; }
+.genre-tile-bars i:nth-child(3) { height: 56%; }
+.genre-tile-bars i:nth-child(4) { height: 100%; }
+.genre-tile-bars i:nth-child(5) { height: 64%; }
+.genre-tile:hover .genre-tile-bars i { animation: genre-eq 0.85s ease-in-out infinite alternate; }
+.genre-tile:hover .genre-tile-bars i:nth-child(2) { animation-delay: 0.12s; }
+.genre-tile:hover .genre-tile-bars i:nth-child(3) { animation-delay: 0.24s; }
+.genre-tile:hover .genre-tile-bars i:nth-child(4) { animation-delay: 0.06s; }
+.genre-tile:hover .genre-tile-bars i:nth-child(5) { animation-delay: 0.18s; }
+@keyframes genre-eq { from { transform: scaleY(0.45); } to { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) {
+  .genre-tile:hover .genre-tile-bars i { animation: none; }
 }
 .genre-tile-name {
+  position: relative;
   z-index: 1;
-  font-size: 17px;
-  font-weight: 720;
+  font-size: 16px;
+  font-weight: 750;
   letter-spacing: -0.01em;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.4);
 }
 .genre-tile-count {
+  position: relative;
   z-index: 1;
-  font-size: 12px;
-  opacity: 0.85;
-}
-.genre-tile-glyph {
-  position: absolute;
-  right: -6px;
-  top: -8px;
-  opacity: 0.22;
-  transform: rotate(-18deg);
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.7);
 }
 
 /* Section heading used in genre detail (above the album grid). */

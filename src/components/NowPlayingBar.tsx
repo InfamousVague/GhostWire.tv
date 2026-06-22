@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { usePlayer, usePlayerProgress } from "../ipc/player";
+import { useLyrics } from "../ipc/lyrics";
+import { LyricsPanel } from "./LyricsPanel";
 import { MusicVisualizer, VIZ_MODES, analyserSampler, useVizMode } from "./MusicVisualizer";
 import { EqPanel } from "./EqPanel";
 import { hueFromString } from "../lib/catalog";
 import { relayMusicUrl } from "../lib/relay";
 import { IN_TAURI } from "../ipc/engine";
 import { findLiked, listPlaylists, toggleLiked, trackKey } from "../ipc/playlists";
-import { heart, music, pause, play, repeat, repeat1, shuffle, skipBack, skipForward, slidersVertical, sparkles, volume2, volumeX, x } from "../lib/icons";
+import { usePlaybackEmit, useRegisterPlayerControls } from "../ext/slots";
+import { heart, micVocal, music, pause, play, repeat, repeat1, shuffle, skipBack, skipForward, slidersVertical, sparkles, volume2, volumeX, x } from "../lib/icons";
 import "./NowPlayingBar.css";
 
 function fmt(s: number): string {
@@ -23,6 +26,8 @@ export function NowPlayingBar() {
   const cur = p.current;
   const [mode, , cycleMode] = useVizMode();
   const [eqOpen, setEqOpen] = useState(false);
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const { lyrics, loading: lyricsLoading } = useLyrics(cur, progress.duration > 0 ? Math.round(progress.duration * 1000) : undefined);
   // A sampler bound to the live analyser; rebuilt when the analyser node changes.
   const samplerRef = useRef(analyserSampler(p.analyser));
   useEffect(() => { samplerRef.current = analyserSampler(p.analyser); }, [p.analyser]);
@@ -34,6 +39,38 @@ export function NowPlayingBar() {
     listPlaylists().then((a) => setLikedSet(new Set((findLiked(a)?.tracks ?? []).map(trackKey)))).catch(() => {});
   }, []);
   useEffect(() => { reloadLiked(); }, [reloadLiked, cur?.id]);
+
+  // Emit playback events for the global audio engine so extensions (scrobblers) see music too.
+  const emitPlayback = usePlaybackEmit();
+  const wasPlaying = useRef(false);
+  const audioEvent = (state: "playing" | "paused"): import("../ext/sdk").PlaybackEvent => ({
+    kind: "audio", state, id: cur?.id ?? "", title: cur?.title ?? "",
+    artist: cur?.artist ?? undefined, album: cur?.album ?? undefined,
+    position: progress.currentTime, duration: progress.duration || undefined,
+    progress: progress.duration > 0 ? Math.min(100, (progress.currentTime / progress.duration) * 100) : undefined,
+  });
+  // Play/pause edge.
+  useEffect(() => {
+    if (!cur) return;
+    if (p.isPlaying === wasPlaying.current) return;
+    wasPlaying.current = p.isPlaying;
+    emitPlayback(audioEvent(p.isPlaying ? "playing" : "paused"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p.isPlaying, cur?.id]);
+  // Throttled progress while playing (gate inside emit limits the rate).
+  useEffect(() => {
+    if (!cur || !p.isPlaying) return;
+    emitPlayback(audioEvent("playing"), { throttleMs: 12000 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress.currentTime, p.isPlaying, cur?.id]);
+
+  // Expose audio controls to extensions (sleep timer pause, etc.).
+  useRegisterPlayerControls("audio", {
+    pause: () => p.pause(),
+    play: () => p.toggle(),
+    current: () => (cur ? { kind: "audio", id: cur.id, title: cur.title, position: progress.currentTime, duration: progress.duration || 0, playing: p.isPlaying } : null),
+  });
+
   if (!cur) return null;
   const t = cur;
   const hue = hueFromString(t.title);
@@ -51,6 +88,22 @@ export function NowPlayingBar() {
       {eqOpen && (
         <div className="npbar-eq-pop">
           <EqPanel eq={p.eq} onClose={() => setEqOpen(false)} />
+        </div>
+      )}
+      {lyricsOpen && (
+        <div className="npbar-lyrics-pop">
+          <div className="npbar-lyrics-head">
+            <span className="npbar-lyrics-title"><Icon icon={micVocal} size="sm" /> Lyrics</span>
+            <button className="np-btn" title="Close lyrics" aria-label="Close lyrics" onClick={() => setLyricsOpen(false)}>
+              <Icon icon={x} size="sm" />
+            </button>
+          </div>
+          <LyricsPanel
+            lyrics={lyrics}
+            loading={lyricsLoading}
+            getActiveTime={() => p.getPosition().currentTime}
+            onSeek={p.seek}
+          />
         </div>
       )}
       <div className="npbar npbar-dock">
@@ -104,6 +157,15 @@ export function NowPlayingBar() {
         <div className="npbar-right">
           <button className="np-btn" title={`Visualizer: ${modeLabel} (click to change)`} aria-label="Cycle visualizer" onClick={() => cycleMode(1)}>
             <Icon icon={sparkles} size="sm" />
+          </button>
+          <button
+            className={`np-btn lyrics-toggle${lyricsOpen ? " on is-on" : ""}`}
+            title="Lyrics"
+            aria-label="Lyrics"
+            aria-pressed={lyricsOpen}
+            onClick={() => setLyricsOpen((v) => !v)}
+          >
+            <Icon icon={micVocal} size="sm" />
           </button>
           <button
             className={`np-btn${eqOpen || p.eq.enabled ? " on" : ""}`}

@@ -251,7 +251,7 @@ export function Anime({ onPlayLocal, posterFor, onReplacePoster, onBrowse, sort,
       ) : anime.length === 0 ? (
         <div className="empty">
           <div className="empty-inner">
-            <span className="empty-glyph"><Icon icon={animeIcon} size="xl" /></span>
+            <img src="/hero-anime.png" alt="" style={{ width: 320, height: "auto", marginBottom: 8 }} />
             <h3>No anime in your library yet</h3>
             <p>Browse <b>Discover</b> for trending and seasonal anime, or tap <b>Find anime</b> to search your sources — anything tagged anime (or from a known fansub group) lands here.</p>
             <div className="form-actions" style={{ marginTop: 14, justifyContent: "center" }}>

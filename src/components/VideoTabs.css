@@ -1,0 +1,34 @@
+/* Icon segmented toggle for the unified Videos section. Matches the app's pill chrome. */
+.vid-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: var(--gg-glass);
+  border: 1px solid var(--gg-glass-brd);
+  box-shadow: inset 0 1px 0 var(--gg-glass-rim);
+  -webkit-backdrop-filter: blur(var(--gg-blur)) saturate(150%);
+  backdrop-filter: blur(var(--gg-blur)) saturate(150%);
+}
+.vid-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--gg-text-muted);
+  font-family: inherit;
+  font-size: var(--text-sm-size);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.vid-tab:hover { color: var(--gg-text); }
+.vid-tab.active {
+  /* Ride the app's tinted "ghost white" so the selected tab matches the rest of the UI. */
+  background: var(--gg-btn-white);
+  color: #0a0a0f;
+}

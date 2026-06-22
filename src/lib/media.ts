@@ -141,32 +141,44 @@ export interface ParsedAnimeEpisode {
   show: string;
   /** Absolute episode number (anime numbers continuously, not per-season). */
   episode: number;
+  /** Fansub re-encode version (v2/v3), when present. */
+  version?: number;
 }
 
+// Release tokens that may directly follow a bare episode number ("Show 12 1080p" after dot-normalize),
+// letting us accept the dot/space-delimited form without grabbing a year or a random trailing number.
+const ANIME_TAG = "(?:\\d{3,4}p|4k|x ?26[45]|h ?26[45]|hevc|av1|blu-?ray|bd|web-?dl|web-?rip|web|hdtv|dual|multi|vostfr|repack|end|final)";
+
 /**
- * Pull `{ show, episode }` from an anime release title, which numbers episodes
+ * Pull `{ show, episode, version }` from an anime release title, which numbers episodes
  * absolutely rather than with S/E — e.g. `[SubsPlease] Sousou no Frieren - 28 (1080p)`,
- * `Title Episode 28`, `Title #28`. Returns null if no episode number is found.
+ * `Title Episode 28`, `Title #28`, `Title.12.1080p`, `Title - 12v2`. Returns null if no episode
+ * number is found. Years (1900–2100) are rejected; high real episode numbers (One Piece 1000+) pass.
  */
 export function parseAnimeEpisode(title: string): ParsedAnimeEpisode | null {
   // Drop leading release-group tags ("[SubsPlease] …") and a file extension.
   let t = title.replace(/[._]+/g, " ").replace(/^\s*(?:\[[^\]]*\]\s*)+/g, "");
-  t = t.replace(/\.(mkv|mp4|avi|webm|m4v)$/i, "").trim();
-  const ok = (show: string, ep: number): ParsedAnimeEpisode | null =>
-    // Reject 4-digit "episodes" that are obviously a year.
-    ep >= 1 && !(ep >= 1900 && ep <= 2100) ? { show: cleanShowName(show), episode: ep } : null;
+  t = t.replace(/\s*\b(mkv|mp4|avi|webm|m4v)$/i, "").trim();
+  const ok = (show: string, ep: number, ver?: string): ParsedAnimeEpisode | null => {
+    if (ep < 1 || (ep >= 1900 && ep <= 2100)) return null; // reject years
+    const r: ParsedAnimeEpisode = { show: cleanShowName(show), episode: ep };
+    if (ver) r.version = +ver;
+    return r;
+  };
 
   // "Title - 28", "Title - 28v2", "Title – 28 (1080p)" — the dominant fansub pattern.
-  let m = t.match(/^(.*?)\s[-–—]\s(\d{1,4})(?:v\d+)?(?=\s|\(|\[|$)/);
-  if (m) return ok(m[1], +m[2]);
-  // "Title Episode 28" / "Title Ep 28" / "Title #28".
+  let m = t.match(/^(.*?)\s[-–—]\s(\d{1,4})(?:v([2-9]))?(?=\s|\(|\[|$)/);
+  if (m) return ok(m[1], +m[2], m[3]);
+  // "Title Episode 28" / "Title Ep 28".
   m = t.match(/^(.*?)\b(?:episode|ep)\.?\s*(\d{1,4})\b/i);
   if (m) return ok(m[1], +m[2]);
+  // "Title #28".
   m = t.match(/^(.*?)#(\d{1,4})\b/);
   if (m) return ok(m[1], +m[2]);
-  // Last resort: a bare trailing number before quality/format tags ("Title 28 [1080p]").
-  m = t.match(/^(.*?)\s(\d{1,4})(?=\s*[([]|$)/);
-  if (m) return ok(m[1], +m[2]);
+  // Bare trailing number before a bracket, end, or a quality/format tag ("Title 28 [1080p]",
+  // "Title 12 1080p" from a dot-delimited name) — with optional v2.
+  m = t.match(new RegExp(`^(.*?)\\s(\\d{1,4})(?:v([2-9]))?(?=\\s*[([]|\\s+${ANIME_TAG}\\b|$)`, "i"));
+  if (m) return ok(m[1], +m[2], m[3]);
   return null;
 }
 

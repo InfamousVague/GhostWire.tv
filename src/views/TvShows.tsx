@@ -149,7 +149,7 @@ export function TvShows({ onPlayLocal, onPlay, onAddToLibrary, posterFor, onRepl
       ) : shows.length === 0 ? (
         <div className="empty">
           <div className="empty-inner">
-            <img src="/hero-tv.png" alt="" style={{ width: 184, height: "auto", marginBottom: 8 }} />
+            <img src="/hero-tv.png" alt="" style={{ width: 320, height: "auto", marginBottom: 8 }} />
             <h3>No TV shows in your library yet</h3>
             <p>Find series under <b>Discover</b> and download them — they'll show up here grouped by show. Open a show to fill in missing episodes.</p>
           </div>

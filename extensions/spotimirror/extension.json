@@ -1,0 +1,26 @@
+{
+  "id": "spotimirror",
+  "name": "SpotiMirror",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "requires": ["spotiflac"],
+  "discovery": {
+    "category": "sync",
+    "tagline": "Mirror your Spotify playlists & Liked Songs — auto-download anything missing via SpotiFLAC.",
+    "featured": true
+  },
+  "description": "Keeps your Spotify playlists and Liked Songs in sync with your local library. Mirrors each playlist into a local copy, finds the tracks you don't have yet, and queues them for lossless download through SpotiFLAC — then re-links them as they land.",
+  "icon": "rotateCw",
+  "permissions": {
+    "network": [],
+    "app": ["library", "downloads", "player"],
+    "storage": true
+  },
+  "contributes": {
+    "nav": ["spotimirror"],
+    "views": ["spotimirror"],
+    "settings": ["spotimirror.config"],
+    "requires": ["spotiflac"]
+  },
+  "frontend": "index.js"
+}

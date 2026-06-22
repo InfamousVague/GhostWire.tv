@@ -25,12 +25,19 @@ import { Sync } from "./views/Sync";
 import { Social } from "./views/Social";
 import { NowPlayingBar } from "./components/NowPlayingBar";
 import { NowPlayingHero } from "./components/NowPlayingHero";
+import { VideoTabs, type VideoTab } from "./components/VideoTabs";
+import { YouTubeVideos } from "./views/YouTubeVideos";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { SyncStatusCard } from "./components/SyncStatusCard";
 import { VpnKillSwitch } from "./components/VpnKillSwitch";
 import { CreateTorrentDialog } from "./components/CreateTorrentDialog";
 import { type Command } from "./components/CommandPalette";
 import { CommandPaletteHost } from "./components/CommandPaletteHost";
+import { ExtensionProvider } from "./ext/host";
+import { ExtensionView, ExtSearchBridge, ExtMusicImporterBridge, ExtViewIdsBridge } from "./ext/slots";
+import type { ExtMusicImporter } from "./ext/sdk";
+import { ExtensionsBrowse } from "./ext/ExtensionsManager";
+import { WatchLater } from "./views/WatchLater";
 import { SETTINGS_TABS } from "./lib/settingsTabs";
 import {
   library as iconLibrary, search as iconSearch, music as iconMusic, tv as iconTv, anime as iconAnime,
@@ -38,6 +45,7 @@ import {
   folderDown as iconDownloads, settings2 as iconSettings, rotateCw as iconRefresh, layers as iconOrganize,
   plus as iconShare, folderOpen as iconFolder, pause as iconPause, play as iconPlay,
   panelLeftClose as iconSidebar, history as iconHistory, magnet as iconMagnet, link2 as iconLink,
+  clock as iconClock,
 } from "./lib/icons";
 import { ContextMenuProvider } from "./components/ContextMenu";
 import { SharesProvider, type ShareControls, type MyShare } from "./ipc/shares";
@@ -47,7 +55,7 @@ import { useVisualizerWindow } from "./ipc/visualizer";
 import { OrganizePanel, type OrganizePhase } from "./components/OrganizePanel";
 import { organizeRun, onOrganizeProgress, type OrganizeResult, type OrganizeStep } from "./ipc/organize";
 import { MOCK_CATALOG, MOCK_SOURCES } from "./lib/catalog";
-import { isAnime, mediaKind, sectionOf, genresOf, type MediaKind, type MediaSectionId, type SectionSort } from "./lib/media";
+import { isAnime, mediaKind, parseEpisode, sectionOf, genresOf, type MediaKind, type MediaSectionId, type SectionSort } from "./lib/media";
 import { cleanTitleForPoster } from "./lib/relay";
 import { getPerfEvents, isPerfEnabled, recordPerf, startPerfTimer, withPerfAsync, type PerfMeta } from "./lib/perf";
 import type { SettingsTab } from "./lib/settingsTabs";
@@ -100,7 +108,6 @@ import {
   searchSources,
   featured as fetchFeatured,
   onVpnDropped,
-  enqueueMusicImport,
   listMusicImports,
   removeMusicImport,
   retryMusicImport,
@@ -112,7 +119,8 @@ import {
   type MusicImportJob,
 } from "./ipc/library";
 
-type AppView = NavId | "player";
+// `string & {}` keeps autocomplete for the known views while letting extensions add their own view ids.
+type AppView = NavId | "player" | (string & {});
 type MusicTab = "browse" | "playlists" | "sync";
 type PlayAudioCollectionOptions = { startId?: string; shuffle?: boolean };
 
@@ -144,6 +152,9 @@ function waitMs(ms: number): Promise<void> {
 }
 // The rail ids that map to a browsable content section.
 const MEDIA_SECTIONS: MediaSectionId[] = ["movies", "tvshows", "music", "books", "games"];
+// The three views unified under the rail's single "Videos" entry (segmented toggle in-view).
+const VIDEO_SECTIONS: VideoTab[] = ["tvshows", "movies", "anime", "youtube"];
+const isVideoView = (v: string): v is VideoTab => (VIDEO_SECTIONS as string[]).includes(v);
 
 function readyKeyForView(view: AppView, musicTab: MusicTab): string | null {
   if (
@@ -152,7 +163,8 @@ function readyKeyForView(view: AppView, musicTab: MusicTab): string | null {
     view === "sources" ||
     view === "export" ||
     view === "automation" ||
-    view === "playlists"
+    view === "playlists" ||
+    view === "youtube"
   ) {
     return null;
   }
@@ -324,6 +336,8 @@ function relayPosterUrl(title: string, kind?: string): string | undefined {
 export default function App() {
   const [view, setView] = useState<AppView>("discover");
   const [prevView, setPrevView] = useState<NavId>("discover");
+  // Which video sub-tab the rail's "Videos" entry returns to (sticks to the last one opened).
+  const [lastVideoView, setLastVideoView] = useState<VideoTab>("tvshows");
   const player = usePlayer();
   const { openWindow: openVisualizerWindow } = useVisualizerWindow(player);
   const { linkedMac } = useLinkedDevice();
@@ -336,6 +350,14 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<CatalogItem[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  // Set by <ExtSearchBridge> (inside ExtensionProvider) — runs extension-contributed search sources.
+  const extSearchRef = useRef<((q: string, now: number) => Promise<CatalogItem[]>) | null>(null);
+  // Set by <ExtMusicImporterBridge> — the active music-link importer (SpotiFLAC), or null when its
+  // extension is disabled (which turns music importing off across the app).
+  const extMusicImporterRef = useRef<ExtMusicImporter | null>(null);
+  // Set by <ExtViewIdsBridge> — ids of extension-contributed views (and which of them supply their
+  // own contextual sidebar). The app's sidebar is hidden only for full-canvas ext views (no sidebar).
+  const [extViews, setExtViews] = useState<{ ids: string[]; sidebars: string[] }>({ ids: [], sidebars: [] });
   const [recents, setRecents] = useState<string[]>(loadRecents);
   // Featured carousel (from the relay) + the movie/show details digest shown on click.
   const [featuredItems, setFeaturedItems] = useState<MovieDigest[]>(() => {
@@ -354,8 +376,13 @@ export default function App() {
   // as cards on the Downloads page). The backend owns the queue + resume; we mirror it.
   const [musicImports, setMusicImports] = useState<MusicImportJob[]>([]);
   async function importMusicLink(url: string) {
+    const importer = extMusicImporterRef.current;
+    if (!importer) {
+      setMusicToast("Enable the SpotiFLAC extension to import music links.");
+      return;
+    }
     try {
-      await enqueueMusicImport(url);
+      await importer.enqueue(url);
       setMusicToast("Added to downloads — importing in the background.");
       setView("downloads");
     } catch (e) {
@@ -436,6 +463,7 @@ export default function App() {
   const [secSort, setSecSort] = useState<SectionSort>("popularity");
   const [secGenre, setSecGenre] = useState<string | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  // The extension selected in the Extensions page master list (null → first installed).
   // Sub-tab within the Music section (browse, import, playlists, and optional sync).
   const [musicTab, setMusicTab] = useState<"browse" | "playlists" | "sync">("browse");
   // Playlist opened from the rail / detail, + a counter bumped to re-fetch playlists after edits.
@@ -1368,7 +1396,8 @@ export default function App() {
    *  already-downloaded copy (instant), otherwise finds the best source and streams it. */
   async function playEpisode(show: string, season: number, episode: number): Promise<boolean> {
     if (!IN_TAURI) return false;
-    const w = show.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const w = norm(show);
     try {
       const have = await listDownloaded();
       // Exact normalized show-name match: list_downloaded titles are already the clean
@@ -1379,7 +1408,7 @@ export default function App() {
           d.mediaType === "show" &&
           d.season === season &&
           d.episode === episode &&
-          d.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() === w,
+          norm(d.title) === w,
       );
       if (local) {
         await playLocal(local);
@@ -1389,14 +1418,31 @@ export default function App() {
       /* fall through to a source search */
     }
     try {
-      const se = `s${String(season).padStart(2, "0")}e${String(episode).padStart(2, "0")}`;
       const hits = await searchSources(`${show} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`);
-      // Prefer a single-episode file (title contains SxxExx, separators ignored) over a
-      // season pack — so playing one episode never streams episode 1 of a whole pack.
-      const single = hits.find((h) => h.title.toLowerCase().replace(/[^a-z0-9]/g, "").includes(se));
-      const pick = single ?? hits[0];
+      // Only stream a result that actually parses to THIS show + THIS episode. The old code
+      // fell back to hits[0] (or any title containing "SxxExx"), which could be an entirely
+      // different show — clicking an episode would jump to the wrong series. Better to find
+      // nothing (the row says "No source") than to play the wrong show.
+      const wantTokens = norm(show).split(" ").filter((t) => t.length >= 2 && !/^\d{4}$/.test(t));
+      const showMatches = (parsedShow: string): boolean => {
+        const ct = norm(parsedShow).split(" ").filter((t) => t.length >= 2 && !/^\d{4}$/.test(t));
+        // Every significant word of the requested show must be present, and the candidate may
+        // carry at most one extra word (a studio/region prefix like "Marvel's"/"US") — this
+        // keeps "Lost" from matching "Lost in Space".
+        return (
+          wantTokens.length > 0 &&
+          wantTokens.every((tok) => ct.includes(tok)) &&
+          ct.filter((tok) => !wantTokens.includes(tok)).length <= 1
+        );
+      };
+      const pick = hits.find((h) => {
+        const p = parseEpisode(h.title);
+        return p != null && p.season === season && p.episode === episode && showMatches(p.show);
+      });
       if (pick) {
-        void startStream(pick);
+        // Stream the episode straight into the (already-open) player — NOT startStream,
+        // which would pop the show's details digest and yank the user out of playback.
+        void streamNow(pick, "video");
         return true;
       }
     } catch (e) {
@@ -1429,13 +1475,23 @@ export default function App() {
     try {
       const epNum = String(episode);
       const hits = await searchSources(`${title} ${epNum.padStart(2, "0")}`);
-      // Prefer a single-episode file whose title carries the absolute number as its own
-      // token (strip resolutions first so "1080p" can't masquerade as the episode).
+      // Require the file to be THIS anime (a strong majority of the title's words appear)
+      // AND carry the absolute episode number as its own token (strip resolutions first so
+      // "1080p" can't masquerade as the episode). Never fall back to hits[0] — that's how a
+      // click would jump to an unrelated series.
       const re = new RegExp(`(^|[^0-9])0*${epNum}([^0-9]|$)`);
-      const single = hits.find((h) => re.test(h.title.replace(/\b\d{3,4}p\b/gi, " ")));
-      const pick = single ?? hits[0];
+      const wantTokens = w.split(" ").filter((t) => t.length >= 2 && !/^\d{4}$/.test(t));
+      const isThisAnime = (t: string): boolean => {
+        if (wantTokens.length === 0) return false;
+        const ct = t.toLowerCase();
+        const present = wantTokens.filter((tok) => ct.includes(tok)).length;
+        return present / wantTokens.length >= 0.6;
+      };
+      const pick = hits.find((h) => isThisAnime(h.title) && re.test(h.title.replace(/\b\d{3,4}p\b/gi, " ")));
       if (pick) {
-        void startStream(pick);
+        // Stream straight into the open player instead of routing through startStream
+        // (which would surface the details digest and interrupt playback).
+        void streamNow(pick, "video");
         return true;
       }
     } catch (e) {
@@ -1501,8 +1557,16 @@ export default function App() {
       const items = await withPerfAsync("navigation", "search.global", () => searchSources(query), {
         queryLength: query.length,
       });
-      setSearchResults(items);
-      setDbItems((d) => mergeCatalog(d, items));
+      // Merge in any extension-contributed search sources (Prowlarr/Jackett etc.). Native results
+      // win on infohash collision (mergeCatalog: first arg overrides). Failures are swallowed inside
+      // the bridge so a flaky extension source can't fail the whole search.
+      let merged = items;
+      if (extSearchRef.current) {
+        const extItems = await extSearchRef.current(query, Date.now()).catch(() => [] as CatalogItem[]);
+        if (extItems.length) merged = mergeCatalog(items, extItems);
+      }
+      setSearchResults(merged);
+      setDbItems((d) => mergeCatalog(d, merged));
       autoPosters();
     } catch (e) {
       setSearchError(String(e));
@@ -1651,7 +1715,7 @@ export default function App() {
   const activeStats = downloads.find((d) => d.id === activeId);
   const activeItem = activeId ? streamItems[activeId] : undefined;
   // Which rail item is highlighted (player overlays its originating section).
-  const activeNav: NavId = view === "player" ? prevView : (view as NavId);
+  const activeNav: AppView = view === "player" ? prevView : view;
   // The shell's contextual sidebar is hidden for sections that drive their own in-view
   // navigation (Library/Playlists/Social) or have no use for the genre filters (Downloads —
   // it lists transfers/on-disk files, which the sidebar's section filters don't apply to).
@@ -1661,7 +1725,11 @@ export default function App() {
     activeNav === "library" ||
     activeNav === "playlists" ||
     activeNav === "downloads" ||
-    activeNav === "social";
+    activeNav === "extensions" ||
+    activeNav === "watch-later" ||
+    activeNav === "social" ||
+    activeNav === "youtube" ||
+    (extViews.ids.includes(activeNav) && !extViews.sidebars.includes(activeNav));
   // The content section to render (null while the player is open or on a non-section view).
   const activeSection = (MEDIA_SECTIONS as string[]).includes(view) ? (view as MediaSectionId) : null;
   // The section whose filters the sidebar shows (sticks to the origin section in the player).
@@ -1684,7 +1752,10 @@ export default function App() {
     void waitFrames(2).then(() => done({ committedView: view }));
   }, [view]);
 
-  function navigate(id: NavId) {
+  function navigate(id: string) {
+    // The rail's single "Videos" entry resolves to whichever sub-tab was last open.
+    if (id === "videos") id = lastVideoView;
+    if (isVideoView(id)) setLastVideoView(id);
     setSecGenre(null); // reset the section filter when switching sections
     navTimerRef.current = startPerfTimer("navigation", "view.navigate", {
       to: id,
@@ -1907,6 +1978,7 @@ export default function App() {
     { id: "go-books", group: "Go to", label: "Books", icon: iconBook, keywords: "ebooks reading", run: () => navigate("books") },
     { id: "go-games", group: "Go to", label: "Games", icon: iconGames, run: () => navigate("games") },
     { id: "go-social", group: "Go to", label: "Friends", icon: iconUsers, keywords: "social shares", run: () => navigate("social") },
+    { id: "go-watch-later", group: "Go to", label: "Watch Later", icon: iconClock, keywords: "queue saved later watchlist", run: () => navigate("watch-later") },
     { id: "go-downloads", group: "Go to", label: "Downloads", icon: iconDownloads, keywords: "transfers queue", run: () => navigate("downloads") },
     { id: "go-settings", group: "Go to", label: "Settings", icon: iconSettings, keywords: "preferences options", run: () => navigate("settings") },
   ];
@@ -1954,6 +2026,10 @@ export default function App() {
       <LibraryProvider>
       <SharesProvider value={shareControls}>
       <ContextMenuProvider>
+      <ExtensionProvider onNavigate={navigate} onAddMagnet={addMagnet} onToast={(m) => setShareToast(m)} onSearch={handleSearch}>
+      <ExtSearchBridge onReady={(fn) => { extSearchRef.current = fn; }} />
+      <ExtMusicImporterBridge onChange={(imp) => { extMusicImporterRef.current = imp; }} />
+      <ExtViewIdsBridge onChange={setExtViews} />
       <div className="app">
       <div className="app-halftone" aria-hidden="true" />
       <TopBar
@@ -1964,7 +2040,7 @@ export default function App() {
       />
       <div className={`app-body${hideSidebar ? " sidebar-collapsed" : ""}`}>
         <NavigationRail
-          active={activeNav}
+          active={isVideoView(activeNav) ? "videos" : activeNav}
           onNavigate={navigate}
           downloadCount={downloads.filter((d) => d.progress < 0.999 && !d.id.startsWith("local:")).length}
           sourceCount={sources.length}
@@ -1973,7 +2049,7 @@ export default function App() {
         />
         <Sidebar
           collapsed={hideSidebar}
-          section={activeNav}
+          section={activeNav as NavId}
           genres={sectionGenres}
           sort={secSort}
           onSort={setSecSort}
@@ -2021,6 +2097,11 @@ export default function App() {
                 onReady={markDiscoverReady}
               />
             )}
+            {isVideoView(view) && (
+              <div className="videos-tabbar">
+                <VideoTabs value={view} onChange={(v) => navigate(v)} />
+              </div>
+            )}
             {activeSection === "tvshows" ? (
               <TvShows onPlayLocal={playLocal} onPlay={startStream} onAddToLibrary={downloadToLibrary} posterFor={posterForTitle} onReplacePoster={setReplaceTitle} onReady={markTvShowsReady} />
             ) : activeSection === "music" ? (
@@ -2062,6 +2143,9 @@ export default function App() {
                 genre={secGenre}
                 onReady={markAnimeReady}
               />
+            )}
+            {view === "youtube" && (
+              <YouTubeVideos onPlayLocal={playLocal} onSummon={() => navigate("seance")} />
             )}
             {view === "settings" && settingsTab === "sources" && (
               <Sources
@@ -2121,6 +2205,7 @@ export default function App() {
             {view === "player" && activeItem && (
               <Player
                 item={activeItem}
+                id={activeId ?? ""}
                 streamUrl={activeItem.url ?? activeStats?.streamUrl}
                 stats={activeStats}
                 info={media}
@@ -2129,6 +2214,10 @@ export default function App() {
                 onPlayAnimeEpisode={playAnimeEpisode}
               />
             )}
+            {view === "extensions" && <ExtensionsBrowse />}
+            {view === "watch-later" && <WatchLater onAddMagnet={addMagnet} onNavigate={navigate} />}
+            {/* Extension-contributed views render here when their id is the active view. */}
+            <ExtensionView id={view} />
             <OrganizePanel
               open={orgOpen}
               phase={orgPhase}
@@ -2184,6 +2273,7 @@ export default function App() {
       <CreateTorrentDialog open={shareDialogOpen} onClose={() => setShareDialogOpen(false)} />
       <CommandPaletteHost commands={paletteCommands} baseDynamic={buildPaletteDynamic} onPlayLocal={playLocal} isMac={IS_MAC} />
       {shareToast && <div className="share-toast" role="status">{shareToast}</div>}
+      </ExtensionProvider>
       </ContextMenuProvider>
       </SharesProvider>
       </LibraryProvider>

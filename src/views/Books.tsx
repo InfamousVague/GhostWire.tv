@@ -83,7 +83,7 @@ export function Books({ onOpenLocal, posterFor, onReady }: BooksProps) {
       ) : books.length === 0 ? (
         <div className="empty">
           <div className="empty-inner">
-            <img src="/hero-library.png" alt="" style={{ width: 184, height: "auto", marginBottom: 8 }} />
+            <img src="/hero-books.png" alt="" style={{ width: 320, height: "auto", marginBottom: 8 }} />
             <h3>No books in your library yet</h3>
             <p>Download EPUB, PDF, and other ebook files from Discover and they will appear here.</p>
           </div>

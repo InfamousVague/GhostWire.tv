@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Button } from "@mattmattmattmatt/base/primitives/button/Button";
 import { Spinner } from "@mattmattmattmatt/base/primitives/spinner/Spinner";
-import type { TvEpisode, TvShow } from "../ipc/library";
-import { circlePlay, tv } from "../lib/icons";
+import { movieDigest, type MovieDigest, type TvEpisode, type TvShow } from "../ipc/library";
+import { IN_TAURI } from "../ipc/engine";
+import { circlePlay, star, tv } from "../lib/icons";
 
 const pad = (n: number) => String(n).padStart(2, "0");
 
@@ -42,6 +43,20 @@ export function ShowPanel({ show, episodes, season, episode, onPlayEpisode, abso
   const [selected, setSelected] = useState(season);
   useEffect(() => setSelected(season), [season]);
 
+  // Pull the show's rich details (cast, ratings, director) from the relay digest so the
+  // player page matches the main show page. Skipped for anime (absolute), whose fansub
+  // titles don't match TMDB reliably.
+  const [digest, setDigest] = useState<MovieDigest | null>(null);
+  useEffect(() => {
+    setDigest(null);
+    if (!IN_TAURI || absolute || !show.name) return;
+    let alive = true;
+    movieDigest("show", show.name, show.year ?? null)
+      .then((d) => { if (alive) setDigest(d); })
+      .catch(() => { /* no digest — cast section just won't render */ });
+    return () => { alive = false; };
+  }, [show.name, show.year, absolute]);
+
   // Per-episode "finding a source" feedback so a click is never silent.
   const [pending, setPending] = useState<string | null>(null);
   const [failed, setFailed] = useState<Set<string>>(new Set());
@@ -77,14 +92,23 @@ export function ShowPanel({ show, episodes, season, episode, onPlayEpisode, abso
         <div className="show-meta-body">
           <h2 className="show-meta-name">{show.name}{show.year ? ` (${show.year})` : ""}</h2>
           <div className="show-meta-line">
-            {[
-              show.network,
-              absolute ? `${episodes.length} episodes` : `${seasons.length} season${seasons.length === 1 ? "" : "s"}`,
-              show.genres.slice(0, 3).join(" · "),
-            ]
-              .filter(Boolean)
-              .join("  ·  ")}
+            {(digest?.imdbRating != null || digest?.rating != null) && (
+              <span className="show-rating">
+                <Icon icon={star} size="xs" /> {(digest.imdbRating ?? digest.rating)!.toFixed(1)}
+              </span>
+            )}
+            <span>
+              {[
+                show.network,
+                absolute ? `${episodes.length} episodes` : `${seasons.length} season${seasons.length === 1 ? "" : "s"}`,
+                (digest?.genres.length ? digest.genres : show.genres).slice(0, 3).join(" · "),
+                digest?.runtimeMinutes ? `${digest.runtimeMinutes} min` : null,
+              ]
+                .filter(Boolean)
+                .join("  ·  ")}
+            </span>
           </div>
+          {digest?.director && <div className="show-credit">Director · {digest.director}</div>}
           {current && (
             <div className="show-now">
               Now playing — {absolute ? `Episode ${episode}` : `S${pad(season)}E${pad(episode)}`}{current.name ? ` · ${current.name}` : ""}
@@ -118,7 +142,7 @@ export function ShowPanel({ show, episodes, season, episode, onPlayEpisode, abso
             </div>
           )}
         </div>
-        <div className="show-eps-list">
+        <div className="show-eps-list" key={selected}>
           {seasonEps.map((e) => {
             const key = `${e.season}-${e.number}`;
             const isCurrent = e.season === season && e.number === episode;
@@ -149,6 +173,23 @@ export function ShowPanel({ show, episodes, season, episode, onPlayEpisode, abso
           })}
         </div>
       </div>
+
+      {digest && digest.cast.length > 0 && (
+        <div className="show-cast">
+          <span className="show-eps-title">Cast</span>
+          <div className="digest-cast">
+            {digest.cast.slice(0, 12).map((c, i) => (
+              <div className="digest-castcard" key={`${c.name}-${i}`}>
+                <div className="digest-castimg">
+                  {c.profile ? <img src={c.profile} alt="" loading="lazy" /> : null}
+                </div>
+                <div className="digest-castname" title={c.name}>{c.name}</div>
+                {c.character && <div className="digest-castrole" title={c.character}>{c.character}</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

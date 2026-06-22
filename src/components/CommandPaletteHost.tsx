@@ -1,5 +1,6 @@
 import { CommandPalette, type Command } from "./CommandPalette";
 import { useDownloaded } from "../ipc/libraryCache";
+import { useExtCommands } from "../ext/slots";
 import type { DownloadedItem } from "../ipc/library";
 import { clapperboard, tv, music as musicIcon, book as bookIcon, gamepad2, circlePlay } from "../lib/icons";
 
@@ -64,10 +65,12 @@ interface CommandPaletteHostProps {
  */
 export function CommandPaletteHost({ commands, baseDynamic, onPlayLocal, isMac }: CommandPaletteHostProps) {
   const { items } = useDownloaded();
+  const extCommands = useExtCommands();
+  const allCommands = extCommands.length ? [...commands, ...extCommands] : commands;
   const buildDynamic = (query: string) => {
     const base = baseDynamic(query);
     const lib = libraryResults(items, query, onPlayLocal);
     return { top: [...(base.top ?? []), ...lib], bottom: base.bottom };
   };
-  return <CommandPalette commands={commands} buildDynamic={buildDynamic} isMac={isMac} />;
+  return <CommandPalette commands={allCommands} buildDynamic={buildDynamic} isMac={isMac} />;
 }

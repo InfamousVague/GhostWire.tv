@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type DragEvent } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import {
   createPlaylist,
@@ -192,22 +192,48 @@ export function MusicPlaylistRail({ activeId, onOpen, refreshKey, onToast, embed
   );
 }
 
-/** Playlist cover: real album art (via the artwork relay, keyed off the first track),
- *  falling back to the list/heart glyph when there's no match or the relay 404s. */
-function PlaylistCover({ p, isLiked }: { p: Playlist; isLiked: boolean }) {
+/** One mosaic cell — an album cover that quietly drops to a tinted blank if the relay 404s. */
+function CoverImg({ src }: { src: string }) {
   const [failed, setFailed] = useState(false);
-  const seed = isLiked ? undefined : p.tracks.find((t) => t.title || t.album || t.artist);
-  const cover = seed ? relayMusicUrl(seed.album || seed.title, seed.artist) : undefined;
-  if (cover && !failed) {
-    return (
-      <span className="mpr-cover">
-        <img src={cover} alt="" loading="lazy" onError={() => setFailed(true)} />
-      </span>
-    );
+  if (failed) return <span className="mpr-cell-blank" />;
+  return <img src={src} alt="" loading="lazy" onError={() => setFailed(true)} />;
+}
+
+/** Playlist cover: a 2×2 mosaic of the album art from the playlist's first distinct albums
+ *  (Spotify/Apple-Music style), gracefully degrading — 1 album → a single cover, 0 → the list
+ *  glyph. Liked Songs keeps its signature heart gradient. */
+function PlaylistCover({ p, isLiked }: { p: Playlist; isLiked: boolean }) {
+  // Up to 4 distinct album covers (keyed by album so the mosaic shows variety, not 4 of one album).
+  const arts = useMemo(() => {
+    if (isLiked) return [];
+    const seen = new Set<string>();
+    const urls: string[] = [];
+    for (const t of p.tracks) {
+      const key = (t.album || t.title || "").toLowerCase().trim();
+      if (!key || seen.has(key)) continue;
+      const url = relayMusicUrl(t.album || t.title, t.artist);
+      if (!url) continue;
+      seen.add(key);
+      urls.push(url);
+      if (urls.length >= 4) break;
+    }
+    return urls;
+  }, [p.tracks, isLiked]);
+
+  if (isLiked) {
+    return <span className="mpr-cover liked"><Icon icon={heart} size="sm" /></span>;
   }
+  if (arts.length === 0) {
+    return <span className="mpr-cover"><Icon icon={listMusic} size="sm" /></span>;
+  }
+  if (arts.length === 1) {
+    return <span className="mpr-cover"><CoverImg src={arts[0]} /></span>;
+  }
+  // 2×2 mosaic — repeat available covers to fill four cells when there are only 2–3 distinct albums.
+  const cells = [arts[0], arts[1], arts[2] ?? arts[0], arts[3] ?? arts[1]];
   return (
-    <span className={`mpr-cover${isLiked ? " liked" : ""}`}>
-      <Icon icon={isLiked ? heart : listMusic} size="sm" />
+    <span className="mpr-cover mpr-cover-grid">
+      {cells.map((src, i) => <CoverImg key={i} src={src} />)}
     </span>
   );
 }

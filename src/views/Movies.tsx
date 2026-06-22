@@ -90,7 +90,7 @@ export function Movies({ onPlayLocal, posterFor, onReplacePoster, onReady }: Mov
       ) : movies.length === 0 ? (
         <div className="empty">
           <div className="empty-inner">
-            <img src="/hero-movies.png" alt="" style={{ width: 184, height: "auto", marginBottom: 8 }} />
+            <img src="/hero-movies.png" alt="" style={{ width: 320, height: "auto", marginBottom: 8 }} />
             <h3>No movies in your library yet</h3>
             <p>Find films under <b>Discover</b> and download them — they'll show up here ready to play.</p>
           </div>

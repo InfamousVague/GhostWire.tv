@@ -1,0 +1,19 @@
+{
+  "id": "trakt-sync",
+  "name": "Trakt.tv Sync",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "sync", "tagline": "Scrobble to Trakt and never lose your place in a series.", "featured": false },
+  "description": "Scrobbles what you watch to Trakt.tv and adds an “Up Next” row of your shows' next episodes to Discover.",
+  "icon": "star",
+  "permissions": {
+    "network": ["api.trakt.tv"],
+    "app": ["player", "discover"],
+    "storage": true
+  },
+  "contributes": {
+    "settings": ["trakt.config"],
+    "discoverRows": ["trakt-up-next"]
+  },
+  "frontend": "index.js"
+}

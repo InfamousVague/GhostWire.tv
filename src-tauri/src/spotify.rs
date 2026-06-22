@@ -19,7 +19,7 @@ use crate::catalog::{Catalog, CatalogItem, Source};
 
 pub const REDIRECT_PORT: u16 = 3031;
 pub const REDIRECT_URI: &str = "http://127.0.0.1:3031/callback";
-const SCOPE: &str = "playlist-read-private playlist-read-collaborative";
+const SCOPE: &str = "playlist-read-private playlist-read-collaborative user-library-read";
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -558,6 +558,143 @@ pub async fn spotify_artist_top_tracks_preview(artist_url: String) -> Result<Pla
         return Err("No top tracks were found for that artist.".to_string());
     }
     Ok(PlaylistPreviewResult { playlist, total, tracks })
+}
+
+// ---- the signed-in user's own library (their playlists + Liked Songs), for SpotiMirror ----
+
+/// One of the signed-in user's playlists (the SpotiMirror sync picker lists these).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MyPlaylist {
+    id: String,
+    name: String,
+    url: Option<String>,
+    owner: Option<String>,
+    image: Option<String>,
+    track_count: i64,
+}
+
+/// List the signed-in user's playlists (paginated). Requires a Spotify login.
+///
+/// Parsed defensively from raw JSON: Spotify's `/me/playlists` is loose — `images` can be `null`,
+/// individual `items` can be `null`, and fields come and go — so strict serde structs reject real
+/// responses ("error decoding response body"). Walking the Value tolerates all of that.
+#[tauri::command]
+pub async fn spotify_my_playlists(catalog: tauri::State<'_, Catalog>) -> Result<Vec<MyPlaylist>, String> {
+    let access = ensure_access(&catalog).await?;
+    let client = http()?;
+    let mut url = "https://api.spotify.com/v1/me/playlists?limit=50".to_string();
+    let mut out = Vec::new();
+    loop {
+        let page: serde_json::Value = client
+            .get(&url)
+            .bearer_auth(&access)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|_| "Couldn't read your Spotify playlists — reconnect Spotify and try again.".to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        for it in page.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let Some(id) = it.get("id").and_then(|v| v.as_str()) else { continue };
+            let id = id.to_string();
+            let link = it
+                .get("external_urls")
+                .and_then(|u| u.get("spotify"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("https://open.spotify.com/playlist/{id}"));
+            let owner = it
+                .get("owner")
+                .and_then(|o| o.get("display_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let image = it
+                .get("images")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|im| im.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Spotify's /me/playlists gives tracks.total, but be defensive about number type +
+            // alternate shapes so a quirk never collapses every playlist to "0 songs".
+            let track_count = it
+                .get("tracks")
+                .and_then(|t| {
+                    t.get("total")
+                        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_f64().map(|f| f as i64)))
+                        .or_else(|| t.as_array().map(|a| a.len() as i64))
+                })
+                .or_else(|| it.get("track_count").and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+            out.push(MyPlaylist {
+                name: it.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled playlist").to_string(),
+                url: Some(link),
+                owner,
+                image,
+                track_count,
+                id,
+            });
+        }
+
+        match page.get("next").and_then(|v| v.as_str()) {
+            Some(n) => url = n.to_string(),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The signed-in user's Liked Songs (paginated). Needs the `user-library-read` scope — a user who
+/// logged in before SpotiMirror shipped must reconnect once to grant it.
+#[tauri::command]
+pub async fn spotify_liked_tracks(catalog: tauri::State<'_, Catalog>) -> Result<Vec<Track>, String> {
+    let access = ensure_access(&catalog).await?;
+    let client = http()?;
+    let mut url =
+        "https://api.spotify.com/v1/me/tracks?limit=50&fields=items(track(id,name,artists(name),album(name,images),duration_ms,external_ids,external_urls,preview_url)),next".to_string();
+    let mut out = Vec::new();
+    loop {
+        let page: TracksPage = client
+            .get(&url)
+            .bearer_auth(&access)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|_| "Couldn't read your Liked Songs — reconnect Spotify to grant library access.".to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        for it in page.items {
+            if let Some(t) = it.track {
+                let id = t.id.clone();
+                let track_url = t
+                    .external_urls
+                    .and_then(|u| u.spotify)
+                    .or_else(|| id.as_ref().map(|i| format!("https://open.spotify.com/track/{i}")));
+                out.push(Track {
+                    artist: t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+                    name: t.name,
+                    album: t.album.name,
+                    album_art: t.album.images.into_iter().next().map(|i| i.url),
+                    duration_ms: t.duration_ms,
+                    isrc: t.external_ids.and_then(|e| e.isrc),
+                    preview_url: t.preview_url,
+                    id,
+                    url: track_url,
+                });
+            }
+        }
+        match page.next {
+            Some(n) => url = n,
+            None => break,
+        }
+    }
+    Ok(dedupe_tracks(out))
 }
 
 const MAX_TRACKS: usize = 50;

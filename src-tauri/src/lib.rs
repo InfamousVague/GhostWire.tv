@@ -8,6 +8,7 @@ mod engine;
 pub mod enrich;
 mod export;
 pub mod indexer;
+pub mod lyrics;
 mod metadata;
 pub mod music;
 mod organize;
@@ -19,6 +20,7 @@ mod subtitles;
 mod remote;
 mod remux;
 mod update_p2p;
+mod extensions;
 mod spotify;
 mod trending;
 pub mod tvmaze;
@@ -310,6 +312,82 @@ async fn share_library_item(
         .create_torrent(&source, None, Vec::new(), true)
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Lyrics for one library track. Resolution waterfall (cheapest first): a sidecar `<stem>.lrc`
+/// (timed) → embedded tags (lofty) → LRCLIB (keyless online, matched by artist/title/album/
+/// duration). Cached 24h per track so repeat plays never re-hit the network. `rel` is the path
+/// relative to the download dir (the same id `list_downloaded`/`list_subtitles` use). Returns
+/// source "none" with empty content when nothing is found — never errors to the UI.
+#[tauri::command]
+async fn song_lyrics(
+    info: tauri::State<'_, AppInfo>,
+    state: tauri::State<'_, LyricsCache>,
+    rel: String,
+    artist: Option<String>,
+    title: Option<String>,
+    album: Option<String>,
+    duration_ms: Option<i64>,
+) -> Result<lyrics::SongLyrics, String> {
+    let artist = artist.unwrap_or_default();
+    let title = title.unwrap_or_default();
+    let album = album.unwrap_or_default();
+    let key = format!(
+        "{}|{}|{}",
+        artist.trim().to_lowercase(),
+        title.trim().to_lowercase(),
+        album.trim().to_lowercase()
+    );
+
+    // Serve a fresh cache hit.
+    if let Ok(cache) = state.cache.lock() {
+        if let Some((sl, at)) = cache.get(&key) {
+            if at.elapsed() < LYRICS_TTL {
+                return Ok(sl.clone());
+            }
+        }
+    }
+
+    let abs = std::path::PathBuf::from(&info.download_dir).join(&rel);
+    let mut resolved: Option<lyrics::SongLyrics> = None;
+
+    // 1) Sidecar .lrc (preferred — it carries timestamps).
+    if let Ok(text) = std::fs::read_to_string(abs.with_extension("lrc")) {
+        let sl = lyrics::SongLyrics::from_text("lrc", &text);
+        if !sl.is_empty() {
+            resolved = Some(sl);
+        }
+    }
+    // 2) Embedded tags (usually unsynced text).
+    if resolved.is_none() {
+        if let Some(text) = metadata::read_lyrics(&abs) {
+            let sl = lyrics::SongLyrics::from_text("embedded", &text);
+            if !sl.is_empty() {
+                resolved = Some(sl);
+            }
+        }
+    }
+    // 3) LRCLIB (keyless online).
+    if resolved.is_none() && !title.trim().is_empty() {
+        if let Ok(client) = reqwest::Client::builder()
+            .user_agent(BROWSER_UA)
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            let dur = duration_ms.filter(|m| *m > 0).map(|ms| (ms as f64 / 1000.0).round() as i64);
+            if let Ok(Some(sl)) =
+                lyrics::fetch_lrclib(&client, artist.trim(), title.trim(), Some(album.trim()), dur).await
+            {
+                resolved = Some(sl);
+            }
+        }
+    }
+
+    let out = resolved.unwrap_or_else(lyrics::SongLyrics::none);
+    if let Ok(mut cache) = state.cache.lock() {
+        cache.insert(key, (out.clone(), Instant::now()));
+    }
+    Ok(out)
 }
 
 // ---- social P2P (P1.2) commands ----
@@ -786,6 +864,76 @@ async fn check_availability(
     Ok(queries.iter().map(|q| *results.get(q.trim()).unwrap_or(&true)).collect())
 }
 
+/// For each episode query (e.g. "One Piece 1001", "Sousou no Frieren - 12"), return the user's
+/// sources' best relevance-ranked torrents — the data behind the anime series builder's per-episode
+/// picker. Like `check_availability`: the shared semaphore caps how many episodes probe at once, and
+/// it persists NOTHING (uses `indexer::search_source` directly, never `search_sources_core`), so a
+/// 24-episode burst never floods the indexers or pollutes the SQLite catalog. Per-episode results are
+/// aligned to `queries`; the client's parser picks the exact episode from these candidates.
+#[tauri::command]
+async fn search_episodes(
+    catalog: tauri::State<'_, Catalog>,
+    state: tauri::State<'_, AvailabilityState>,
+    queries: Vec<String>,
+    limit: Option<usize>,
+) -> Result<Vec<Vec<CatalogItem>>, String> {
+    let cap = limit.unwrap_or(6).clamp(1, 20);
+    let sources: Arc<Vec<Source>> = Arc::new(
+        catalog
+            .list_sources()
+            .map_err(|e| format!("{e:#}"))?
+            .into_iter()
+            .filter(|s| s.enabled)
+            .collect(),
+    );
+    if sources.is_empty() {
+        return Ok(queries.iter().map(|_| Vec::new()).collect());
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for (i, q) in queries.iter().enumerate() {
+        let query = q.trim().to_string();
+        let sem = state.sem.clone();
+        let srcs = sources.clone();
+        set.spawn(async move {
+            // The owned permit caps how many EPISODES probe their sources concurrently.
+            let _permit = sem.acquire_owned().await.ok();
+            if query.is_empty() {
+                return (i, Vec::new());
+            }
+            let now = now_ms();
+            let mut inner = tokio::task::JoinSet::new();
+            for s in srcs.iter() {
+                let (kind, url, name, qq) = (s.kind.clone(), s.url.clone(), s.name.clone(), query.clone());
+                inner.spawn(async move {
+                    indexer::search_source(&kind, &url, &qq, &name, now).await.unwrap_or_default()
+                });
+            }
+            let mut merged: Vec<CatalogItem> = Vec::new();
+            let mut seen = HashSet::new();
+            while let Some(res) = inner.join_next().await {
+                if let Ok(items) = res {
+                    for it in items {
+                        if seen.insert(it.id.clone()) {
+                            merged.push(it);
+                        }
+                    }
+                }
+            }
+            let ranked: Vec<CatalogItem> = rank_by_relevance(&query, merged).into_iter().take(cap).collect();
+            (i, ranked)
+        });
+    }
+    let mut out: Vec<Vec<CatalogItem>> = vec![Vec::new(); queries.len()];
+    while let Some(res) = set.join_next().await {
+        if let Ok((i, items)) = res {
+            if i < out.len() {
+                out[i] = items;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod relevance_tests {
     use super::{query_tokens, title_score};
@@ -827,6 +975,27 @@ fn get_setting(catalog: tauri::State<'_, Catalog>, key: String) -> Option<String
 #[tauri::command]
 fn set_setting(catalog: tauri::State<'_, Catalog>, key: String, value: String) -> Result<(), String> {
     catalog.set_setting(&key, &value).map_err(|e| format!("{e:#}"))
+}
+
+/// Turn a loopback stream URL (what the player uses) into a LAN-reachable URL with a stream token,
+/// so a DLNA renderer / cast target on the network can fetch it. Used by the Cast extension.
+#[tauri::command]
+fn cast_url(catalog: tauri::State<'_, Catalog>, url: String) -> Option<String> {
+    let parsed = reqwest::Url::parse(&url).ok()?;
+    let path = parsed.path().to_string();
+    let secret = catalog.get_setting("pairing_secret")?;
+    let tk = crate::remote::mint_token(&secret, 6 * 3600);
+    let ip = {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("8.8.8.8:80").ok()?;
+        sock.local_addr().ok()?.ip().to_string()
+    };
+    let mut q = parsed.query().map(|s| s.to_string()).unwrap_or_default();
+    if !q.is_empty() {
+        q.push('&');
+    }
+    q.push_str(&format!("tk={tk}"));
+    Some(format!("http://{ip}:{}{}?{}", crate::engine::STREAM_PORT, path, q))
 }
 
 #[tauri::command]
@@ -2324,6 +2493,77 @@ fn normalize_service(service: &str) -> String {
     }
 }
 
+/// Every audio provider the bundled SpotiFLAC build accepts for `--service`.
+const SPOTIFLAC_SERVICES: &[&str] = &[
+    "tidal", "qobuz", "deezer", "amazon", "joox", "netease", "migu", "kuwo", "soundcloud",
+    "youtube", "apple", "pandora", "flacdownloader",
+];
+
+/// Parse the `spotiflac_service` setting (a space/comma separated priority list) into a validated,
+/// de-duped provider list. Falls back to a robust multi-provider chain when empty/unrecognised so a
+/// single failing provider can't stall every download.
+fn normalize_services(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in raw.split(|c: char| c.is_whitespace() || c == ',') {
+        let t = tok.trim().to_ascii_lowercase();
+        if !t.is_empty() && SPOTIFLAC_SERVICES.contains(&t.as_str()) && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    if out.is_empty() {
+        // Deezer is deliberately NOT in the default chain: without an account it serves 30-second
+        // preview clips, which is exactly the "songs saved at 30s" problem. Users can re-add it from
+        // the SpotiFLAC settings once authed. Tidal (public pool) + Qobuz are lossless, YouTube is a
+        // full-length last resort.
+        out = ["tidal", "qobuz", "youtube"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
+    out
+}
+
+/// Resolved SpotiFLAC download settings (Settings ▸ Extensions ▸ SpotiFLAC). Read fresh per
+/// download so changes apply to already-queued tracks too.
+struct SpotiflacConfig {
+    services: Vec<String>,
+    quality: String,
+    retries: u32,
+    timeout: Option<u32>,
+    lyrics: bool,
+    enrich: bool,
+    tidal_api: Option<String>,
+    qobuz_api: Option<String>,
+}
+
+fn spotiflac_config(catalog: &Catalog) -> SpotiflacConfig {
+    let get = |k: &str| {
+        catalog
+            .get_setting(k)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    // Default to a 120s per-track cap so a provider that can't match a song skips it instead of
+    // hanging the whole queue forever. An explicit "0" means "no limit".
+    let timeout = match get("spotiflac_timeout") {
+        Some(s) => s.parse::<u32>().ok().filter(|t| *t > 0),
+        None => Some(120),
+    };
+    SpotiflacConfig {
+        services: normalize_services(&get("spotiflac_service").unwrap_or_default()),
+        quality: get("spotiflac_quality").unwrap_or_else(|| "LOSSLESS".to_string()),
+        retries: get("spotiflac_retries")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(2)
+            .min(10),
+        timeout,
+        lyrics: get("spotiflac_lyrics").as_deref() != Some("0"),
+        enrich: get("spotiflac_enrich").as_deref() != Some("0"),
+        tidal_api: get("spotiflac_tidal_api"),
+        qobuz_api: get("spotiflac_qobuz_api"),
+    }
+}
+
 #[tauri::command]
 fn music_spotiflac_status(info: tauri::State<'_, AppInfo>) -> MusicSpotiFlacStatus {
     let output_dir = music_output_dir(info.inner()).display().to_string();
@@ -2521,6 +2761,354 @@ async fn music_spotiflac_download(
     })
 }
 
+// ============================================================================================
+// Séance — summon videos from YouTube/Vimeo/Twitch/… via yt-dlp (the video sibling of SpotiFLAC).
+// Mirrors the SpotiFLAC native flow: resolve/install the CLI, stream stdout/stderr to the frontend
+// as `seance://output` events, watch the output dir for the finished file, and fold it into the
+// library. Downloads land under Library/Videos so the scanner indexes them automatically.
+// ============================================================================================
+
+const SEANCE_OUTPUT_EVENT: &str = "seance://output";
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SeanceStatus {
+    available: bool,
+    command: Option<String>,
+    output_dir: String,
+    hint: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SeanceResult {
+    command: String,
+    output_dir: String,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SeanceInstallResult {
+    command: String,
+    resolved_command: Option<String>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SeanceOutput {
+    stream: String,
+    line: String,
+    completed_files: Option<usize>,
+}
+
+fn resolve_ytdlp() -> Option<PathBuf> {
+    find_bin("yt-dlp")
+}
+
+fn video_output_dir(info: &AppInfo) -> PathBuf {
+    PathBuf::from(&info.download_dir).join("Library").join("Videos")
+}
+
+fn current_video_file_set(root: &Path) -> HashSet<String> {
+    export::scan(root)
+        .into_iter()
+        .filter(|item| item.kind == "video")
+        .map(|item| item.path)
+        .collect()
+}
+
+async fn pump_seance_output<R>(
+    app: tauri::AppHandle,
+    stream: &'static str,
+    reader: R,
+    lines: Arc<tokio::sync::Mutex<Vec<String>>>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut reader = tokio::io::BufReader::new(reader).lines();
+    while let Ok(Some(line)) = reader.next_line().await {
+        let line = line.trim_end().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let _ = app.emit(
+            SEANCE_OUTPUT_EVENT,
+            SeanceOutput { stream: stream.to_string(), line: line.clone(), completed_files: None },
+        );
+        let mut out = lines.lock().await;
+        out.push(line);
+        if out.len() > 240 {
+            let drop_n = out.len() - 240;
+            out.drain(0..drop_n);
+        }
+    }
+}
+
+async fn emit_seance_completed_files(app: &tauri::AppHandle, output_dir: &Path, baseline: &HashSet<String>) {
+    let count = current_video_file_set(output_dir).into_iter().filter(|p| !baseline.contains(p)).count();
+    let _ = app.emit(
+        SEANCE_OUTPUT_EVENT,
+        SeanceOutput { stream: "meta".to_string(), line: String::new(), completed_files: Some(count) },
+    );
+}
+
+async fn watch_seance_completed_files(
+    app: tauri::AppHandle,
+    output_dir: PathBuf,
+    baseline: HashSet<String>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(700));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_count = usize::MAX;
+    loop {
+        tokio::select! {
+            _ = &mut stop => {
+                emit_seance_completed_files(&app, &output_dir, &baseline).await;
+                break;
+            }
+            _ = interval.tick() => {
+                let count = current_video_file_set(&output_dir).into_iter().filter(|p| !baseline.contains(p)).count();
+                if count != last_count {
+                    last_count = count;
+                    let _ = app.emit(
+                        SEANCE_OUTPUT_EVENT,
+                        SeanceOutput { stream: "meta".to_string(), line: String::new(), completed_files: Some(count) },
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn ytdlp_install_attempts() -> Vec<(String, Vec<String>)> {
+    let mut cmds = Vec::new();
+    if let Some(brew) = find_bin("brew") {
+        cmds.push((brew.display().to_string(), vec!["install".to_string(), "yt-dlp".to_string()]));
+    }
+    if let Some(pipx) = find_bin("pipx") {
+        cmds.push((pipx.display().to_string(), vec!["install".to_string(), "--force".to_string(), "yt-dlp".to_string()]));
+    }
+    if let Some(py) = preferred_python_for_install() {
+        cmds.push((
+            py.display().to_string(),
+            vec![
+                "-m".to_string(),
+                "pip".to_string(),
+                "install".to_string(),
+                "--user".to_string(),
+                "--upgrade".to_string(),
+                "yt-dlp".to_string(),
+            ],
+        ));
+    }
+    cmds
+}
+
+#[tauri::command]
+fn seance_status(info: tauri::State<'_, AppInfo>) -> SeanceStatus {
+    let output_dir = video_output_dir(info.inner()).display().to_string();
+    match resolve_ytdlp() {
+        Some(program) => SeanceStatus { available: true, command: Some(program.display().to_string()), output_dir, hint: None },
+        None => SeanceStatus {
+            available: false,
+            command: None,
+            output_dir,
+            hint: Some(
+                "Install yt-dlp so GhostWire can summon videos (for example: `brew install yt-dlp` or `python3 -m pip install --user yt-dlp`)."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+#[tauri::command]
+async fn seance_install() -> Result<SeanceInstallResult, String> {
+    if let Some(p) = resolve_ytdlp() {
+        return Ok(SeanceInstallResult {
+            command: p.display().to_string(),
+            resolved_command: Some(p.display().to_string()),
+            stdout: "yt-dlp is already installed.".to_string(),
+            stderr: String::new(),
+        });
+    }
+    let path = system_path_for_installs();
+    let attempts = ytdlp_install_attempts();
+    if attempts.is_empty() {
+        return Err("Couldn't find `brew`, `pipx`, or `python3`, so GhostWire can't install yt-dlp automatically on this machine.".to_string());
+    }
+    let mut failures = Vec::new();
+    for (program, args) in attempts {
+        let (ok, rendered, stdout, stderr) = run_install_capture(program, args, path.clone(), 200).await?;
+        if ok {
+            let resolved = resolve_ytdlp().map(|p| p.display().to_string());
+            return Ok(SeanceInstallResult { command: rendered, resolved_command: resolved, stdout, stderr });
+        }
+        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { "exit status unknown".to_string() };
+        failures.push(format!("{rendered}: {detail}"));
+    }
+    Err(format!("Couldn't install yt-dlp automatically. {}", failures.join(" | ")))
+}
+
+#[tauri::command]
+async fn seance_download(
+    app: tauri::AppHandle,
+    info: tauri::State<'_, AppInfo>,
+    cache: tauri::State<'_, ScanCache>,
+    url: String,
+    quality: Option<String>,
+) -> Result<SeanceResult, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("Paste a video URL first.".to_string());
+    }
+    let program = resolve_ytdlp().ok_or_else(|| {
+        "yt-dlp not found. Install it first, then relaunch GhostWire if you opened the app from Finder.".to_string()
+    })?;
+    let output_dir = video_output_dir(info.inner());
+    std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
+    let baseline_files = current_video_file_set(&output_dir);
+    let has_ffmpeg = info.ffmpeg_available;
+
+    let out_template = output_dir.join("%(title).200B [%(id)s].%(ext)s").display().to_string();
+    let q = quality.unwrap_or_else(|| "best".to_string()).trim().to_ascii_lowercase();
+
+    // .part files keep the final name from appearing until the download (and any merge) finishes,
+    // so the completed-file watcher only fires when the video is truly ready.
+    let mut args: Vec<String> = vec![
+        "--newline".to_string(),
+        "--no-playlist".to_string(),
+        "--no-mtime".to_string(),
+        "--restrict-filenames".to_string(),
+    ];
+    if q == "audio" {
+        if has_ffmpeg {
+            args.extend(["-x".to_string(), "--audio-format".to_string(), "mp3".to_string(), "-f".to_string(), "bestaudio/best".to_string()]);
+        } else {
+            args.extend(["-f".to_string(), "bestaudio[ext=m4a]/bestaudio/best".to_string()]);
+        }
+    } else {
+        let height = match q.as_str() {
+            "1080" | "1080p" => Some(1080),
+            "720" | "720p" => Some(720),
+            "480" | "480p" => Some(480),
+            _ => None,
+        };
+        if has_ffmpeg {
+            let fmt = match height {
+                Some(h) => format!("bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"),
+                None => "bestvideo*+bestaudio/best".to_string(),
+            };
+            args.extend(["-f".to_string(), fmt, "--merge-output-format".to_string(), "mp4".to_string(), "--embed-metadata".to_string()]);
+        } else {
+            let fmt = match height {
+                Some(h) => format!("best[height<={h}][ext=mp4]/best[height<={h}]/best"),
+                None => "best[ext=mp4]/best".to_string(),
+            };
+            args.extend(["-f".to_string(), fmt]);
+        }
+    }
+    args.extend(["-o".to_string(), out_template, url]);
+
+    let rendered = render_command(&program, &[], &args);
+    let _ = app.emit(
+        SEANCE_OUTPUT_EVENT,
+        SeanceOutput { stream: "meta".to_string(), line: format!("Summoning: {rendered}"), completed_files: None },
+    );
+
+    let (progress_stop_tx, progress_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let progress_task = tokio::spawn(watch_seance_completed_files(
+        app.clone(),
+        output_dir.clone(),
+        baseline_files.clone(),
+        progress_stop_rx,
+    ));
+
+    let mut command = tokio::process::Command::new(&program);
+    command.args(&args);
+    command.env("PATH", system_path_for_installs());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = progress_stop_tx.send(());
+            let _ = progress_task.await;
+            return Err(format!("Couldn't launch yt-dlp: {err}"));
+        }
+    };
+
+    let stdout_lines = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let stderr_lines = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let stdout_task = child.stdout.take().map(|stdout| {
+        let app = app.clone();
+        let lines = stdout_lines.clone();
+        tokio::spawn(async move { pump_seance_output(app, "stdout", stdout, lines).await; })
+    });
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let app = app.clone();
+        let lines = stderr_lines.clone();
+        tokio::spawn(async move { pump_seance_output(app, "stderr", stderr, lines).await; })
+    });
+
+    let status = child.wait().await;
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+
+    let stdout = {
+        let lines = stdout_lines.lock().await;
+        tail_vec_lines(&lines, 120)
+    };
+    let stderr = {
+        let lines = stderr_lines.lock().await;
+        tail_vec_lines(&lines, 120)
+    };
+    let _ = progress_stop_tx.send(());
+    let _ = progress_task.await;
+
+    let completed_files = current_video_file_set(&output_dir)
+        .into_iter()
+        .filter(|path| !baseline_files.contains(path))
+        .count();
+    let status = status.map_err(|e| e.to_string())?;
+    if !status.success() {
+        let detail = if !stderr.is_empty() {
+            stderr.clone()
+        } else if !stdout.is_empty() {
+            stdout.clone()
+        } else {
+            format!("yt-dlp exited with status {:?}.", status.code())
+        };
+        return Err(format!("Séance couldn't summon that video. {detail}"));
+    }
+    if completed_files == 0 {
+        let detail = if !stderr.is_empty() {
+            stderr.clone()
+        } else if !stdout.is_empty() {
+            stdout.clone()
+        } else {
+            "yt-dlp finished but no new video file appeared.".to_string()
+        };
+        return Err(format!("yt-dlp finished but saved no new video in {}. {}", output_dir.display(), detail));
+    }
+
+    invalidate_scan(&cache);
+    Ok(SeanceResult {
+        command: rendered,
+        output_dir: output_dir.display().to_string(),
+        stdout,
+        stderr,
+    })
+}
+
 // ============================================================================
 // Persistent music-import queue.
 //
@@ -2533,6 +3121,11 @@ async fn music_spotiflac_download(
 // ============================================================================
 
 const MUSIC_IMPORTS_EVENT: &str = "music-imports://state";
+/// Kill + flag an import as stalled if no new track lands for this long while it's still running.
+const MUSIC_IMPORT_STALL_SECS: u64 = 180;
+/// A lone downloaded track shorter than this is treated as a provider *preview* clip (e.g. an
+/// unauthed Deezer 30s sample), not the real song — it's binned so the track re-downloads.
+const PREVIEW_MAX_SECS: f64 = 35.0;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -2566,6 +3159,12 @@ struct MusicImportManager {
     notify: tokio::sync::Notify,
     persist_path: PathBuf,
     app: tauri::AppHandle,
+    /// Files already attributed to a currently-running import, so concurrent imports sharing the
+    /// output dir never count the same downloaded file twice.
+    claimed: tokio::sync::Mutex<HashSet<String>>,
+    /// Nudged whenever the queue changes; a single flusher coalesces these into throttled,
+    /// off-thread persist + emit passes.
+    flush: tokio::sync::Notify,
 }
 
 impl MusicImportManager {
@@ -2573,13 +3172,37 @@ impl MusicImportManager {
         self.jobs.lock().await.clone()
     }
 
-    /// Write the current job list to disk and broadcast it to the frontend.
-    async fn persist_and_emit(&self) {
+    /// Snapshot the queue, broadcast it to the UI, and write it to disk OFF the async executor
+    /// (compact JSON on a blocking thread). Called only by the flusher + at startup, so writes
+    /// stay serialized and a huge queue never stalls the runtime mid-download.
+    async fn flush_now(&self) {
         let jobs = self.jobs.lock().await.clone();
-        if let Ok(json) = serde_json::to_string_pretty(&jobs) {
-            let _ = std::fs::write(&self.persist_path, json);
-        }
         let _ = self.app.emit(MUSIC_IMPORTS_EVENT, &jobs);
+        let path = self.persist_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(json) = serde_json::to_string(&jobs) {
+                let _ = std::fs::write(&path, json);
+            }
+        })
+        .await;
+    }
+
+    /// Request a coalesced persist + emit. Cheap + non-blocking: the background flusher batches
+    /// bursts, so many imports each reporting progress every 800ms don't each re-serialize and
+    /// re-broadcast the entire (possibly thousands-deep) queue.
+    fn request_flush(&self) {
+        self.flush.notify_one();
+    }
+}
+
+/// Coalesces persist/emit requests: on each nudge it waits a short beat then flushes once, bounding
+/// the queue's disk-write + UI-broadcast rate to a few per second no matter how many imports are
+/// running. This is what keeps a 1000+ job queue from hanging the app during downloads.
+async fn music_import_flusher(manager: Arc<MusicImportManager>) {
+    loop {
+        manager.flush.notified().await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        manager.flush_now().await;
     }
 }
 
@@ -2597,7 +3220,40 @@ fn load_music_import_jobs(path: &Path) -> Vec<MusicImportJob> {
             job.current_track = None;
         }
     }
-    jobs
+    // Collapse duplicate links (a track re-enqueued across many re-syncs) so a runaway queue
+    // self-heals on launch. Keep the most-complete state per URL: done > queued > error.
+    let rank = |state: &str| -> u8 {
+        match state {
+            "done" => 3,
+            "queued" | "downloading" => 2,
+            "error" => 1,
+            _ => 0,
+        }
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut by_url: std::collections::HashMap<String, MusicImportJob> =
+        std::collections::HashMap::new();
+    let mut passthrough: Vec<MusicImportJob> = Vec::new();
+    for job in jobs {
+        if job.url.is_empty() {
+            passthrough.push(job);
+            continue;
+        }
+        match by_url.get(&job.url) {
+            Some(prev) if rank(&prev.state) >= rank(&job.state) => { /* keep the better one */ }
+            Some(_) => {
+                by_url.insert(job.url.clone(), job);
+            }
+            None => {
+                order.push(job.url.clone());
+                by_url.insert(job.url.clone(), job);
+            }
+        }
+    }
+    let mut deduped: Vec<MusicImportJob> =
+        order.into_iter().filter_map(|u| by_url.remove(&u)).collect();
+    deduped.extend(passthrough);
+    deduped
 }
 
 fn music_import_random_id() -> String {
@@ -2686,25 +3342,41 @@ fn music_track_label_from_path(path: &str) -> String {
     }
 }
 
-/// Scan for the newest new file (by mtime) and report the running count + its label.
-fn music_import_progress_detail(
+/// Claim any newly-appeared music files for THIS job on a first-come basis so two imports sharing
+/// the output folder never count the same downloaded file twice, then report this job's running
+/// count + the newest track's label. Files present before the job started (`baseline`) or already
+/// claimed by another running import are skipped.
+async fn claim_new_music_files(
+    manager: &MusicImportManager,
     root: &Path,
     baseline: &HashSet<String>,
+    my_files: &Arc<tokio::sync::Mutex<HashSet<String>>>,
 ) -> (u32, Option<String>) {
-    let mut count = 0u32;
-    let mut newest: Option<(SystemTime, String)> = None;
-    for path in current_music_file_set(root) {
-        if baseline.contains(&path) {
-            continue;
+    {
+        let current = current_music_file_set(root);
+        let mut mine = my_files.lock().await;
+        let mut claimed = manager.claimed.lock().await;
+        for path in current {
+            if baseline.contains(&path) || mine.contains(&path) || claimed.contains(&path) {
+                continue;
+            }
+            claimed.insert(path.clone());
+            mine.insert(path);
         }
-        count += 1;
-        if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+    }
+    let mine = my_files.lock().await;
+    let mut newest: Option<(SystemTime, String)> = None;
+    for path in mine.iter() {
+        if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) {
             if newest.as_ref().map_or(true, |(t, _)| modified > *t) {
                 newest = Some((modified, path.clone()));
             }
         }
     }
-    (count, newest.map(|(_, p)| music_track_label_from_path(&p)))
+    (
+        mine.len() as u32,
+        newest.map(|(_, p)| music_track_label_from_path(&p)),
+    )
 }
 
 /// Best-effort friendly title, track count, and cover art for a queued import. Tries
@@ -2766,14 +3438,35 @@ where
     }
 }
 
+/// Probe a media file's duration in seconds via the bundled ffprobe. `None` when ffprobe is
+/// unavailable or the file can't be read.
+async fn probe_duration_secs(ffprobe: &Path, path: &Path) -> Option<f64> {
+    let out = tokio::process::Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|d| *d > 0.0)
+}
+
 /// Run SpotiFLAC for one queued import, updating `job.completed` as files land.
 /// Returns the number of new files written on success.
 async fn run_music_import_job(
     manager: &Arc<MusicImportManager>,
     id: &str,
     url: &str,
-    service: &str,
-    quality: &str,
 ) -> Result<u32, String> {
     let app = manager.app.clone();
 
@@ -2787,42 +3480,61 @@ async fn run_music_import_job(
     let cmd = resolve_spotiflac().ok_or_else(|| {
         "SpotiFLAC CLI not found. Install it first, then relaunch GhostWire if you opened the app from Finder.".to_string()
     })?;
-    let service = normalize_service(service);
-    let quality = if quality.trim().is_empty() {
-        "LOSSLESS".to_string()
-    } else {
-        quality.trim().to_string()
+    let cfg = {
+        let catalog = app.state::<Catalog>();
+        spotiflac_config(catalog.inner())
     };
 
-    let mut args = vec![
-        url.to_string(),
-        output_dir.display().to_string(),
-        "--service".to_string(),
-        service.clone(),
-        "--quality".to_string(),
-        quality,
-        "--use-artist-subfolders".to_string(),
-        "--use-album-subfolders".to_string(),
-        "--use-album-track-numbers".to_string(),
-        "--first-artist-only".to_string(),
-        "--filename-format".to_string(),
-        "{track}. {title}".to_string(),
-        "--verbose".to_string(),
-    ];
-    let mut tidal_api_mode = "spotiflac_public";
-    {
-        let catalog = app.state::<Catalog>();
-        if let Some(tidal_api) = catalog
-            .get_setting("spotiflac_tidal_api")
-            .filter(|s| !s.trim().is_empty())
-        {
-            tidal_api_mode = "custom";
-            args.push("--tidal-api".to_string());
-            args.push(tidal_api.trim().to_string());
-        }
+    let mut args = vec![url.to_string(), output_dir.display().to_string()];
+    // `--service` is variadic (priority order); keep it right after the positionals and before the
+    // next flag so argparse bounds it correctly.
+    args.push("--service".to_string());
+    for svc in &cfg.services {
+        args.push(svc.clone());
+    }
+    args.push("--quality".to_string());
+    args.push(cfg.quality.clone());
+    args.push("--use-artist-subfolders".to_string());
+    args.push("--use-album-subfolders".to_string());
+    args.push("--use-album-track-numbers".to_string());
+    args.push("--first-artist-only".to_string());
+    args.push("--filename-format".to_string());
+    args.push("{track}. {title}".to_string());
+    if cfg.retries > 0 {
+        args.push("--retries".to_string());
+        args.push(cfg.retries.to_string());
+    }
+    if let Some(secs) = cfg.timeout {
+        args.push("--timeout".to_string());
+        args.push(secs.to_string());
+    }
+    if !cfg.lyrics {
+        args.push("--no-lyrics".to_string());
+    }
+    if !cfg.enrich {
+        args.push("--no-enrich".to_string());
+    }
+    args.push("--verbose".to_string());
+    let tidal_api_mode = if let Some(api) = &cfg.tidal_api {
+        args.push("--tidal-api".to_string());
+        args.push(api.clone());
+        "custom"
+    } else {
+        "spotiflac_public"
+    };
+    if let Some(api) = &cfg.qobuz_api {
+        args.push("--qobuz-local-api".to_string());
+        args.push(api.clone());
     }
     let program = cmd.program.clone();
     let fixed_args = cmd.fixed_args.clone();
+
+    // Files THIS job has claimed (shared with the final count). Concurrency-safe: each downloaded
+    // file is attributed to exactly one running import via the manager's shared `claimed` set.
+    let my_files: Arc<tokio::sync::Mutex<HashSet<String>>> =
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    // Watchdog: the progress poller trips this when no new track lands for MUSIC_IMPORT_STALL_SECS.
+    let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Poll the output folder and reflect file counts into the job's progress.
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2830,18 +3542,29 @@ async fn run_music_import_job(
     let progress_id = id.to_string();
     let progress_dir = output_dir.clone();
     let progress_baseline = baseline_files.clone();
+    let progress_files = Arc::clone(&my_files);
     let progress_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(800));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = u32::MAX;
         let mut last_track: Option<String> = None;
+        let mut last_progress = std::time::Instant::now();
+        let mut kill_tx = Some(kill_tx);
         loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
                 _ = interval.tick() => {
-                    let (count, track) =
-                        music_import_progress_detail(&progress_dir, &progress_baseline);
+                    let (count, track) = claim_new_music_files(
+                        &progress_manager,
+                        &progress_dir,
+                        &progress_baseline,
+                        &progress_files,
+                    )
+                    .await;
                     if count != last || track != last_track {
+                        if count != last {
+                            last_progress = std::time::Instant::now();
+                        }
                         last = count;
                         last_track = track.clone();
                         {
@@ -2853,7 +3576,12 @@ async fn run_music_import_job(
                                 }
                             }
                         }
-                        progress_manager.persist_and_emit().await;
+                        progress_manager.request_flush();
+                    }
+                    if last_progress.elapsed() >= Duration::from_secs(MUSIC_IMPORT_STALL_SECS) {
+                        if let Some(tx) = kill_tx.take() {
+                            let _ = tx.send(());
+                        }
                     }
                 }
             }
@@ -2885,7 +3613,21 @@ async fn run_music_import_job(
         tokio::spawn(async move { drain_import_lines(stderr, lines).await })
     });
 
-    let status = child.wait().await;
+    let mut stalled = false;
+    let wait = tokio::select! {
+        s = child.wait() => Some(s),
+        _ = &mut kill_rx => None,
+    };
+    let status = match wait {
+        Some(s) => s,
+        None => {
+            // Watchdog tripped: no new track landed for MUSIC_IMPORT_STALL_SECS. Kill the hung
+            // process so its queue slot frees and the job can be retried (SpotiFLAC resumes).
+            stalled = true;
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    };
     if let Some(task) = stdout_task {
         let _ = task.await;
     }
@@ -2895,6 +3637,25 @@ async fn run_music_import_job(
     let _ = stop_tx.send(());
     let _ = progress_task.await;
 
+    // Final claim pass for files written between the last poll and exit, then release this job's
+    // claims (future imports skip them via their own baseline anyway).
+    let completed = claim_new_music_files(manager, &output_dir, &baseline_files, &my_files)
+        .await
+        .0;
+    {
+        let mine = my_files.lock().await;
+        let mut claimed = manager.claimed.lock().await;
+        for path in mine.iter() {
+            claimed.remove(path);
+        }
+    }
+    // Files added by ANY import during this job's lifetime — lets us tell a genuine silent failure
+    // (nobody downloaded anything) apart from "a concurrent import claimed this job's file".
+    let global_new = current_music_file_set(&output_dir)
+        .into_iter()
+        .filter(|p| !baseline_files.contains(p))
+        .count() as u32;
+
     let stdout = {
         let lines = stdout_lines.lock().await;
         tail_vec_lines(&lines, 120)
@@ -2903,11 +3664,6 @@ async fn run_music_import_job(
         let lines = stderr_lines.lock().await;
         tail_vec_lines(&lines, 120)
     };
-
-    let completed = current_music_file_set(&output_dir)
-        .into_iter()
-        .filter(|p| !baseline_files.contains(p))
-        .count() as u32;
 
     let build_detail = |fallback: &str| -> String {
         let mut detail = if !stderr.is_empty() {
@@ -2926,18 +3682,48 @@ async fn run_music_import_job(
         detail
     };
 
+    // Preview guard: a lone ~30s result is a provider preview (e.g. an unauthed Deezer clip), not
+    // the song — bin it so the track re-downloads from a full-length source instead of silently
+    // keeping a 30-second snippet.
+    if completed == 1 {
+        let lone = { my_files.lock().await.iter().next().cloned() };
+        if let (Some(ffprobe), Some(path)) = (engine::resolve_ffmpeg().1, lone) {
+            if let Some(dur) = probe_duration_secs(&ffprobe, Path::new(&path)).await {
+                if dur < PREVIEW_MAX_SECS {
+                    let _ = std::fs::remove_file(&path);
+                    {
+                        let mut c = manager.claimed.lock().await;
+                        c.remove(&path);
+                    }
+                    invalidate_scan(app.state::<ScanCache>().inner());
+                    return Err(format!(
+                        "Got a {dur:.0}s preview, not the full track. Retry to fetch it from another source."
+                    ));
+                }
+            }
+        }
+    }
+
+    // Any file written = (partial) success regardless of how the process ended, so the queue keeps
+    // moving; the user can re-run to fill any gaps.
+    if completed > 0 {
+        invalidate_scan(app.state::<ScanCache>().inner());
+        return Ok(completed);
+    }
+    if stalled {
+        let detail = build_detail("No tracks were saved before the import stalled.");
+        return Err(format!(
+            "Download stalled — no progress for {MUSIC_IMPORT_STALL_SECS}s. Retry to resume. {detail}"
+        ));
+    }
     let status = status.map_err(|e| e.to_string())?;
     if !status.success() {
-        // A non-zero exit that still wrote files is treated as a partial success so
-        // the queue can move on; the user can re-run to fill any gaps.
-        if completed > 0 {
-            invalidate_scan(app.state::<ScanCache>().inner());
-            return Ok(completed);
-        }
         let detail = build_detail(&format!("SpotiFLAC exited with status {:?}.", status.code()));
         return Err(format!("SpotiFLAC failed. {detail}"));
     }
-    if completed == 0 {
+    // Exited cleanly but this job claimed nothing. If no import wrote anything either it's a real
+    // silent failure; otherwise a concurrent import grabbed the file — treat this one as done.
+    if global_new == 0 {
         let detail = build_detail(
             "SpotiFLAC exited successfully, but no new music files were written to disk.",
         );
@@ -2945,62 +3731,79 @@ async fn run_music_import_job(
     }
 
     invalidate_scan(app.state::<ScanCache>().inner());
-    Ok(completed)
+    Ok(0)
 }
 
-/// Background worker: processes queued imports one at a time, forever.
-async fn music_import_worker(manager: Arc<MusicImportManager>) {
-    loop {
-        let next_id = {
-            let jobs = manager.jobs.lock().await;
-            jobs.iter()
-                .find(|j| j.state == "queued")
-                .map(|j| j.id.clone())
-        };
-        let Some(id) = next_id else {
-            manager.notify.notified().await;
-            continue;
-        };
+/// How many imports may download at once. Read fresh each scheduling pass so the user can tune it
+/// live (Settings ▸ SpotiMirror). Defaults to 3; clamped to a sane 1–6.
+fn music_import_concurrency(app: &tauri::AppHandle) -> usize {
+    app.state::<Catalog>()
+        .get_setting("music_import_concurrency")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, 6)
+}
 
-        let target = {
+/// Background scheduler: runs up to `music_import_concurrency` imports at once, each in its own task
+/// with a stall watchdog. A single hung download no longer blocks the whole queue, and several
+/// tracks download in parallel.
+async fn music_import_worker(manager: Arc<MusicImportManager>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    loop {
+        let limit = music_import_concurrency(&manager.app);
+        let next = if in_flight.load(Ordering::Acquire) < limit {
             let mut jobs = manager.jobs.lock().await;
-            match jobs.iter_mut().find(|j| j.id == id) {
+            match jobs.iter_mut().find(|j| j.state == "queued") {
                 Some(job) => {
                     job.state = "downloading".to_string();
                     job.error = None;
-                    Some((job.url.clone(), job.service.clone(), job.quality.clone()))
+                    job.current_track = None;
+                    Some((job.id.clone(), job.url.clone()))
                 }
                 None => None,
             }
+        } else {
+            None
         };
-        let Some((url, service, quality)) = target else {
+        let Some((id, url)) = next else {
+            // At capacity, or nothing queued — sleep until enqueue/retry or a freed slot nudges us.
+            manager.notify.notified().await;
             continue;
         };
-        manager.persist_and_emit().await;
+        manager.request_flush();
 
-        let result = run_music_import_job(&manager, &id, &url, &service, &quality).await;
-
-        {
-            let mut jobs = manager.jobs.lock().await;
-            if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
-                match &result {
-                    Ok(count) => {
-                        job.completed = (*count).max(job.completed);
-                        if job.total.is_none() {
-                            job.total = Some(job.completed);
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let mgr = Arc::clone(&manager);
+        let slots = Arc::clone(&in_flight);
+        tokio::spawn(async move {
+            let result = run_music_import_job(&mgr, &id, &url).await;
+            {
+                let mut jobs = mgr.jobs.lock().await;
+                if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+                    match &result {
+                        Ok(count) => {
+                            job.completed = (*count).max(job.completed);
+                            if job.total.is_none() {
+                                job.total = Some(job.completed);
+                            }
+                            job.state = "done".to_string();
+                            job.error = None;
+                            job.current_track = None;
                         }
-                        job.state = "done".to_string();
-                        job.error = None;
-                        job.current_track = None;
-                    }
-                    Err(err) => {
-                        job.state = "error".to_string();
-                        job.error = Some(err.clone());
+                        Err(err) => {
+                            job.state = "error".to_string();
+                            job.error = Some(err.clone());
+                            job.current_track = None;
+                        }
                     }
                 }
             }
-        }
-        manager.persist_and_emit().await;
+            mgr.request_flush();
+            slots.fetch_sub(1, Ordering::AcqRel);
+            // A slot just freed — wake the scheduler to pull the next queued import.
+            mgr.notify.notify_one();
+        });
     }
 }
 
@@ -3013,6 +3816,17 @@ async fn music_import_enqueue(
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("Paste a music link first.".to_string());
+    }
+    // De-dupe: if this exact link is already waiting or downloading, hand back that job rather than
+    // piling on a duplicate (which would download the same track twice and bloat the queue).
+    {
+        let jobs = manager.jobs.lock().await;
+        if let Some(existing) = jobs
+            .iter()
+            .find(|j| j.url == url && (j.state == "queued" || j.state == "downloading"))
+        {
+            return Ok(existing.clone());
+        }
     }
     let kind = detect_music_import_kind(&url);
     let (title, total, artwork_url) = music_import_preview(catalog.inner(), &url, kind).await;
@@ -3036,7 +3850,7 @@ async fn music_import_enqueue(
         let mut jobs = manager.jobs.lock().await;
         jobs.push(job.clone());
     }
-    manager.persist_and_emit().await;
+    manager.request_flush();
     manager.notify.notify_one();
     Ok(job)
 }
@@ -3058,8 +3872,76 @@ async fn music_import_remove(
         // Leave an actively-downloading job in place (its process keeps running).
         jobs.retain(|j| j.id != id || j.state == "downloading");
     }
-    manager.persist_and_emit().await;
+    manager.request_flush();
     Ok(())
+}
+
+/// Bulk-clear imports by state (e.g. drop a runaway queue, or wipe finished/failed cards) in one
+/// pass. Actively-downloading jobs are always kept — their process is still running.
+#[tauri::command]
+async fn music_imports_clear(
+    manager: tauri::State<'_, Arc<MusicImportManager>>,
+    states: Vec<String>,
+) -> Result<(), String> {
+    {
+        let mut jobs = manager.jobs.lock().await;
+        jobs.retain(|j| j.state == "downloading" || !states.iter().any(|s| s == &j.state));
+    }
+    manager.request_flush();
+    Ok(())
+}
+
+/// Find and delete the 30-second preview clips a provider may have saved instead of the real song,
+/// then return the Spotify URLs of the affected tracks so the caller can re-queue full downloads.
+/// A linked file counts as a preview when it's well under the track's known length (or, when the
+/// length is unknown, only the unmistakable ~30s clips).
+#[tauri::command]
+async fn music_purge_previews(
+    info: tauri::State<'_, AppInfo>,
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+    let ffprobe = engine::resolve_ffmpeg()
+        .1
+        .ok_or_else(|| "ffprobe isn't available, so previews can't be detected.".to_string())?;
+    let data_dir = info.data_dir.clone();
+    let mut urls: Vec<String> = Vec::new();
+    for mut pl in playlist::list(&data_dir) {
+        let mut changed = false;
+        for t in &mut pl.tracks {
+            let Some(path) = t.path.clone() else { continue };
+            let p = Path::new(&path);
+            if !p.exists() {
+                continue;
+            }
+            let Some(dur) = probe_duration_secs(&ffprobe, p).await else {
+                continue;
+            };
+            let expected = (t.duration_ms as f64) / 1000.0;
+            let is_preview = if expected > 50.0 {
+                dur < expected * 0.6 && (expected - dur) > 25.0
+            } else {
+                dur < PREVIEW_MAX_SECS
+            };
+            if is_preview {
+                let _ = std::fs::remove_file(p);
+                if let Some(u) = t.spotify_url.clone() {
+                    if !urls.contains(&u) {
+                        urls.push(u);
+                    }
+                }
+                t.path = None;
+                changed = true;
+            }
+        }
+        if changed {
+            pl.updated_at = now_ms();
+            let _ = playlist::save(&data_dir, &pl);
+        }
+    }
+    if !urls.is_empty() {
+        invalidate_scan(app.state::<ScanCache>().inner());
+    }
+    Ok(urls)
 }
 
 #[tauri::command]
@@ -3074,7 +3956,7 @@ async fn music_import_retry(
             job.error = None;
         }
     }
-    manager.persist_and_emit().await;
+    manager.request_flush();
     manager.notify.notify_one();
     Ok(())
 }
@@ -3560,6 +4442,8 @@ pub(crate) struct DownloadedItem {
     track_no: Option<i64>,
     /// Embedded album artwork (music only), served from the local /art cache.
     artwork_url: Option<String>,
+    /// True when the track comes with lyrics (embedded tag or sidecar `.lrc`) — lights the row icon.
+    has_lyrics: bool,
     size_bytes: i64,
     /// File mtime as epoch seconds — drives the "Recently added" feed.
     added_at: i64,
@@ -3903,6 +4787,14 @@ struct AvailabilityState {
 }
 const AVAIL_TTL: Duration = Duration::from_secs(6 * 3600);
 
+/// Resolved song lyrics, cached with a long TTL (lyrics are immutable) keyed by a normalized
+/// artist|title|album, so the same track never re-hits LRCLIB on repeat plays.
+#[derive(Clone)]
+struct LyricsCache {
+    cache: Arc<Mutex<HashMap<String, (lyrics::SongLyrics, Instant)>>>,
+}
+const LYRICS_TTL: Duration = Duration::from_secs(24 * 3600);
+
 /// A "the library on disk may have changed, please re-reconcile" doorbell for the background
 /// indexer. Triggered by the FS watcher (and, for snappy UX, mutation handlers). The indexer
 /// thread waits on the condvar, so triggers while it's busy coalesce into one extra pass.
@@ -4142,6 +5034,9 @@ fn enrich_row(e: &export::Exportable, rel: &str, art_dir: &std::path::Path) -> L
         genre,
         track_no,
         artwork_url,
+        // Cheap: a sidecar .lrc is a free fs check; embedded lyrics reuse the lofty open. Only audio
+        // can carry lyrics, so the icon never lights for video/books/games.
+        has_lyrics: e.kind == "audio" && metadata::has_lyrics(&abs),
     }
 }
 
@@ -4163,6 +5058,7 @@ fn row_to_item(r: LibraryFileRow, info: &AppInfo, removed: &HashSet<String>) -> 
         genre: r.genre,
         track_no: r.track_no,
         artwork_url: r.artwork_url,
+        has_lyrics: r.has_lyrics,
         size_bytes: r.size_bytes,
         added_at: r.added_at,
         url,
@@ -4641,6 +5537,12 @@ async fn organize_run(
     .await;
     invalidate_scan(&cache); // files moved on disk
     nudge_indexer(&app_idx); // reconcile the index against the new organized paths
+    // Tell the torrent engine that any finished download whose files we just moved into Library/
+    // is no longer at its Downloads/ staging path, so librqbit forgets it instead of re-creating
+    // (overwrite:true) and re-downloading it on the next re-check — the duplicate-copy bug.
+    if let Some(engine) = app_engine(&app_idx) {
+        engine.reconcile_storage().await;
+    }
     Ok(res)
 }
 
@@ -4989,6 +5891,11 @@ async fn dedupe_apply(
     .map_err(|e| e.to_string())?;
     invalidate_scan(&cache); // files gone from disk
     nudge_indexer(&app_idx); // reconcile so the de-duped files leave the index
+    // Same coordination as organize: if we just trashed a finished torrent's content, drop it from
+    // the engine/session so librqbit doesn't re-create and re-download it.
+    if let Some(engine) = app_engine(&app_idx) {
+        engine.reconcile_storage().await;
+    }
     Ok(res)
 }
 
@@ -5737,6 +6644,36 @@ async fn stop_app_seed(app: tauri::AppHandle) -> Result<(), String> {
     update_p2p::stop_seeding_app(app).await.map_err(|e| format!("{e:#}"))
 }
 
+/// What this machine is currently seeding, with the music tags read straight from each file —
+/// so the "My shares" UI can resolve album covers (matched to a share by infohash). The album
+/// cover needs (album, artist), which the share's display title alone doesn't carry.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SeedingShareMeta {
+    infohash: String,
+    artist: Option<String>,
+    album: Option<String>,
+    title: Option<String>,
+    media_type: Option<String>,
+}
+
+#[tauri::command]
+async fn seeding_shares(app: tauri::AppHandle) -> Result<Vec<SeedingShareMeta>, String> {
+    let engine = engine_state(&app)?;
+    Ok(engine
+        .seeding_shares(None)
+        .await
+        .into_iter()
+        .map(|s| SeedingShareMeta {
+            infohash: s.infohash,
+            artist: s.artist,
+            album: s.album,
+            title: s.track_title,
+            media_type: s.media_type,
+        })
+        .collect())
+}
+
 #[tauri::command]
 fn relaunch_for_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -6096,6 +7033,18 @@ async fn anime_detail(title: String) -> Result<Option<anime::AnimeDetail>, Strin
     Ok(anime::anime_detail(&client, title.trim()).await)
 }
 
+/// Search anime by title → multiple candidates for the series-builder's disambiguation step.
+/// Keyless (AniList → Jikan). Empty when nothing matches.
+#[tauri::command]
+async fn anime_search(query: String) -> Result<Vec<anime::AnimeItem>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(anime::anime_search(&client, query.trim()).await)
+}
+
 /// For a chosen show, search every linked source and bucket the magnets by season
 /// (validated against TMDB's real season list when a key is set) so each season is
 /// one click to stream.
@@ -6174,6 +7123,7 @@ pub fn run() {
                 cache: Arc::new(Mutex::new(HashMap::new())),
                 sem: Arc::new(tokio::sync::Semaphore::new(6)),
             });
+            app.manage(LyricsCache { cache: Arc::new(Mutex::new(HashMap::new())) });
 
             // Streaming engine (librqbit + loopback HTTP server).
             let download_dir = stored_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
@@ -6288,11 +7238,16 @@ pub fn run() {
                 notify: tokio::sync::Notify::new(),
                 persist_path: import_persist,
                 app: app.handle().clone(),
+                claimed: tokio::sync::Mutex::new(HashSet::new()),
+                flush: tokio::sync::Notify::new(),
             });
             app.manage(import_manager.clone());
             tauri::async_runtime::spawn(async move {
-                // Broadcast the restored state, then process the queue forever.
-                import_manager.persist_and_emit().await;
+                // Broadcast the restored state, then run the queue + its throttled persist/emit
+                // flusher (which keeps a large queue from hanging the app during downloads).
+                import_manager.flush_now().await;
+                let flusher = Arc::clone(&import_manager);
+                tauri::async_runtime::spawn(async move { music_import_flusher(flusher).await });
                 music_import_worker(import_manager).await;
             });
             Ok(())
@@ -6321,6 +7276,7 @@ pub fn run() {
             search_sources,
             get_setting,
             set_setting,
+            cast_url,
             clear_catalog,
             tidal_auth_status,
             tidal_save_credentials,
@@ -6341,7 +7297,12 @@ pub fn run() {
             music_import_enqueue,
             music_imports_list,
             music_import_remove,
+            music_imports_clear,
+            music_purge_previews,
             music_import_retry,
+            seance_status,
+            seance_install,
+            seance_download,
             enrich_catalog,
             fetch_posters,
             tv_search,
@@ -6392,10 +7353,24 @@ pub fn run() {
             p2p_update,
             start_app_seed,
             stop_app_seed,
+            seeding_shares,
+            extensions::ext_set_perms,
+            extensions::ext_fetch,
+            extensions::ext_list,
+            extensions::ext_install_from_url,
+            extensions::ext_remove,
+            extensions::ext_start_sidecar,
+            extensions::ext_start_bundled_sidecar,
+            extensions::ext_invoke,
+            extensions::ext_stop_sidecar,
+            extensions::ext_sidecar_selftest,
             list_exportable,
             export_items,
             popular_shows,
             popular_anime,
+            anime_search,
+            search_episodes,
+            song_lyrics,
             discover_feed,
             check_availability,
             anime_detail,
@@ -6421,6 +7396,8 @@ pub fn run() {
             spotify::spotify_album_art,
             spotify::spotify_search_artists,
             spotify::spotify_artist_albums,
+            spotify::spotify_my_playlists,
+            spotify::spotify_liked_tracks,
             social_status,
             social_register,
             social_login,

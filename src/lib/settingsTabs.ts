@@ -1,9 +1,10 @@
 // Settings categories — shared so the shell Sidebar can render the sub-nav in the same
 // sidebar card the other sections use, while Settings.tsx renders the matching pane.
-import { film, folderOutput, gauge, globe, hardDrive, info, rss, server, sparkles, triangleAlert } from "./icons";
+import { film, folderOutput, gauge, globe, hardDrive, info, rss, server, sparkles, slidersVertical, triangleAlert } from "./icons";
 
 export const SETTINGS_TABS = [
   { id: "general", label: "General", icon: info },
+  { id: "appearance", label: "Appearance", icon: slidersVertical },
   { id: "storage", label: "Storage", icon: hardDrive },
   { id: "media", label: "Media", icon: film },
   { id: "artwork", label: "Artwork", icon: globe },

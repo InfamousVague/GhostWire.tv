@@ -1,0 +1,19 @@
+{
+  "id": "prowlarr-bridge",
+  "name": "Prowlarr / Jackett Bridge",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "sources", "tagline": "Plug in your Prowlarr/Jackett indexers and search them all.", "featured": false },
+  "description": "Search your self-hosted Prowlarr or Jackett indexers from GhostWire — results merge straight into the app's search.",
+  "icon": "link2",
+  "permissions": {
+    "network": ["*", "localhost", "127.0.0.1"],
+    "app": ["search"],
+    "storage": true
+  },
+  "contributes": {
+    "settings": ["prowlarr.config"],
+    "searchSource": ["prowlarr"]
+  },
+  "frontend": "index.js"
+}

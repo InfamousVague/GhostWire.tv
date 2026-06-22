@@ -62,6 +62,12 @@ build:
 		echo "WARN: APPLE_SIGNING_IDENTITY not set — the build won't be signed."; \
 		echo "      Create .env.apple (see .env.apple.example) first."; \
 	fi
+	@echo "=== Staging native extension sidecars for externalBin ==="
+	@cd $(TAURI) && TRIPLE=$$(rustc -vV | awk '/host:/{print $$2}') && \
+		cargo build --release --bin gw_ext_sidecar --bin gw_discord_sidecar --bin gw_cast_sidecar && \
+		for b in gw_ext_sidecar gw_discord_sidecar gw_cast_sidecar; do \
+			cp -f "target/release/$$b" "binaries/$$b-$$TRIPLE"; \
+		done
 	@echo "=== Building signed Tauri release (+ OTA updater artifacts) ==="
 	cd $(ROOT) && \
 		env -u TAURI_SIGNING_PRIVATE_KEY_PATH -u TAURI_SIGNING_KEY_PATH \

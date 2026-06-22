@@ -1,0 +1,12 @@
+{
+  "id": "pip",
+  "name": "Picture-in-Picture",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "player", "tagline": "Float the video and keep browsing.", "featured": false },
+  "description": "Pop the current video into a floating Picture-in-Picture window so you can keep browsing while it plays.",
+  "icon": "airplay",
+  "permissions": { "app": ["player"] },
+  "contributes": { "commands": ["pip.toggle"] },
+  "frontend": "index.js"
+}

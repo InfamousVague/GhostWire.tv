@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS library_files (
   genre       TEXT,
   track_no    INTEGER,
   artwork_url TEXT,
+  has_lyrics  INTEGER NOT NULL DEFAULT 0,
   indexed_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_libfiles_added ON library_files(added_at DESC);
@@ -163,6 +164,8 @@ pub struct LibraryFileRow {
     pub genre: Option<String>,
     pub track_no: Option<i64>,
     pub artwork_url: Option<String>,
+    /// True when the track comes with lyrics (embedded tag or a sidecar `.lrc`) — lights the icon.
+    pub has_lyrics: bool,
 }
 
 /// `Clone` is cheap: the SQLite connection lives behind `Arc<Mutex<…>>`, so a clone
@@ -182,6 +185,10 @@ impl Catalog {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
+        // Migration: `CREATE TABLE IF NOT EXISTS` won't add a new column to an existing DB, so add
+        // `has_lyrics` here. Harmless "duplicate column name" on subsequent launches is swallowed;
+        // existing rows read has_lyrics=0 until the background indexer re-walks and backfills.
+        let _ = conn.execute("ALTER TABLE library_files ADD COLUMN has_lyrics INTEGER NOT NULL DEFAULT 0", []);
         Ok(Catalog {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -373,7 +380,7 @@ impl Catalog {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT rel_path,size_bytes,added_at,kind,media_type,season,episode,title,file_name,\
-             artist,album,genre,track_no,artwork_url FROM library_files ORDER BY added_at DESC",
+             artist,album,genre,track_no,artwork_url,has_lyrics FROM library_files ORDER BY added_at DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -392,6 +399,7 @@ impl Catalog {
                     genre: r.get(11)?,
                     track_no: r.get(12)?,
                     artwork_url: r.get(13)?,
+                    has_lyrics: r.get::<_, i64>(14)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -416,17 +424,18 @@ impl Catalog {
                 tx.execute(
                     "INSERT INTO library_files
                        (rel_path,size_bytes,added_at,kind,media_type,season,episode,title,file_name,\
-                        artist,album,genre,track_no,artwork_url,indexed_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                        artist,album,genre,track_no,artwork_url,has_lyrics,indexed_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
                      ON CONFLICT(rel_path) DO UPDATE SET
                        size_bytes=excluded.size_bytes, added_at=excluded.added_at, kind=excluded.kind,
                        media_type=excluded.media_type, season=excluded.season, episode=excluded.episode,
                        title=excluded.title, file_name=excluded.file_name, artist=excluded.artist,
                        album=excluded.album, genre=excluded.genre, track_no=excluded.track_no,
-                       artwork_url=excluded.artwork_url, indexed_at=excluded.indexed_at",
+                       artwork_url=excluded.artwork_url, has_lyrics=excluded.has_lyrics, indexed_at=excluded.indexed_at",
                     params![
                         r.rel_path, r.size_bytes, r.added_at, r.kind, r.media_type, r.season, r.episode,
-                        r.title, r.file_name, r.artist, r.album, r.genre, r.track_no, r.artwork_url, indexed_at
+                        r.title, r.file_name, r.artist, r.album, r.genre, r.track_no, r.artwork_url,
+                        r.has_lyrics as i64, indexed_at
                     ],
                 )?;
             }

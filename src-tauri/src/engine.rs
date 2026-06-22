@@ -404,7 +404,7 @@ impl Engine {
                 for h in &to_pause {
                     let _ = session.pause(h).await;
                 }
-                schedule_queue(&session, &torrents, max_active).await;
+                schedule_queue(&session, &torrents, max_active, &std::collections::HashSet::new()).await;
             }
         }
         let transcode_errors: TranscodeErrors = Arc::new(RwLock::new(HashMap::new()));
@@ -513,6 +513,7 @@ impl Engine {
             let session = session.clone();
             let max_active_downloads = max_active_downloads.clone();
             let network_blocked = network_blocked.clone();
+            let hls = hls.clone();
             let ffmpeg_on = ffmpeg.is_some();
             tauri::async_runtime::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -522,7 +523,10 @@ impl Engine {
                     // scheduler release a queued download back onto the (now unprotected) network.
                     if !network_blocked.load(Ordering::SeqCst) {
                         let max_active = *max_active_downloads.read().await;
-                        schedule_queue(&session, &torrents, max_active).await;
+                        // Protect any torrent that is currently feeding an HLS transcode from being
+                        // paused by the queue — otherwise streaming a still-downloading file stalls.
+                        let streaming = streaming_ids(&hls).await;
+                        schedule_queue(&session, &torrents, max_active, &streaming).await;
                     }
                     let snap = build_snapshot(&torrents, &pending, ffmpeg_on).await;
                     let _ = app.emit(DOWNLOADS_EVENT, &snap);
@@ -563,7 +567,7 @@ impl Engine {
     pub async fn resume_all_network(&self) {
         self.network_blocked.store(false, Ordering::SeqCst);
         let max_active = *self.max_active_downloads.read().await;
-        schedule_queue(&self.session, &self.torrents, max_active).await;
+        schedule_queue(&self.session, &self.torrents, max_active, &streaming_ids(&self.hls).await).await;
     }
 
     /// Add a magnet; returns its infohash (the id everything else is keyed by). `queue=true`
@@ -572,6 +576,20 @@ impl Engine {
     /// to dial immediately — a friend's share carries the seeder's address so the swarm
     /// negotiates right away instead of waiting on (often-fruitless) DHT discovery.
     pub async fn add(&self, magnet: &str, queue: bool, initial_peers: Vec<SocketAddr>) -> Result<String> {
+        // Idempotency guard (covers BOTH queue paths). If this magnet's torrent is already
+        // managed — downloading, queued, or finished+seeding — or still resolving, return the
+        // existing id instead of adding it again. Without this, a recurring caller (the RSS
+        // auto-downloader polling a feed whose Torznab guids rotate per request) re-invokes add()
+        // for the SAME magnet on every poll; the queue=false branch below skipped straight to
+        // add_magnet, so each call re-resolved the same infohash and — combined with overwrite:true
+        // re-creating any missing files — could manufacture duplicate on-disk copies. Returning the
+        // live id makes every initiation path idempotent and preserves the existing entry's state
+        // (e.g. a stream preview of an already-seeding torrent no longer flips it out of seed mode).
+        if let Some(id) = infohash_from_magnet(magnet) {
+            if self.torrents.read().await.contains_key(&id) || self.pending.read().await.contains_key(&id) {
+                return Ok(id);
+            }
+        }
         // Stream previews resolve synchronously — the caller opens the player right after and needs
         // the resolved handle. Downloads, by contrast, must appear INSTANTLY: resolving a magnet's
         // metadata (session.add_torrent) can take many seconds — sometimes ~a minute — and used to
@@ -615,7 +633,7 @@ impl Engine {
                     let _ = session.delete(h.info_hash().into(), true).await;
                 }
                 let max_active = *max_active_downloads.read().await;
-                schedule_queue(&session, &torrents, max_active).await;
+                schedule_queue(&session, &torrents, max_active, &std::collections::HashSet::new()).await;
                 return;
             }
             if let Err(e) = res {
@@ -900,8 +918,59 @@ impl Engine {
         }
         // Removing a download frees its slot — let the next queued one start.
         let max_active = *self.max_active_downloads.read().await;
-        schedule_queue(&self.session, &self.torrents, max_active).await;
+        schedule_queue(&self.session, &self.torrents, max_active, &streaming_ids(&self.hls).await).await;
         Ok(())
+    }
+
+    /// De-register any FINISHED torrent whose on-disk content has been moved or deleted out of the
+    /// `Downloads/` staging folder — the fix for the "6-7 duplicate copies" bug.
+    ///
+    /// When a download finishes, librqbit keeps it ALIVE and seeding, with its output still pointing
+    /// at `Downloads/<name>`, and persists it to the session store. Separately, the auto-cleanup /
+    /// organize pass `fs::rename`s that finished file into `Library/` behind librqbit's back. On the
+    /// next re-check (a relaunch re-adopts the persisted seed, or it otherwise re-initializes) librqbit
+    /// finds the files gone and — because every add uses `overwrite:true` — RE-CREATES empty shells in
+    /// `Downloads/` and re-downloads the whole torrent; the next auto-cleanup moves that fresh copy too,
+    /// and the loop compounds into 6-7 duplicates.
+    ///
+    /// Calling this right after files are moved breaks the loop at the source: `remove(.., false)` drops
+    /// the torrent from the live session AND from the JSON session persistence (keeping the on-disk
+    /// files, which are now safely under `Library/`), so a relaunch never restores it and never
+    /// re-downloads. Only finished/seeding torrents are considered: an in-progress download always has
+    /// its file shell present in `Downloads/<name>`, so it is never matched. Returns how many were
+    /// forgotten.
+    pub async fn reconcile_storage(&self) -> usize {
+        let downloads_dir = self.download_dir.join("Downloads");
+        let gone: Vec<String> = {
+            let t = self.torrents.read().await;
+            t.iter()
+                .filter(|(_, e)| e.is_seed || e.handle.stats().finished)
+                .filter_map(|(id, e)| {
+                    let name = e.handle.name()?;
+                    if name.is_empty() {
+                        return None;
+                    }
+                    // librqbit stages a single-file torrent at `Downloads/<name>` and a multi-file
+                    // one in the directory `Downloads/<name>/…`; either way the per-torrent content
+                    // root is `Downloads/<name>`. If it no longer exists, the content was filed away.
+                    if downloads_dir.join(&name).exists() {
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
+                })
+                .collect()
+        };
+        for id in &gone {
+            let _ = self.remove(id, false).await;
+        }
+        if !gone.is_empty() {
+            eprintln!(
+                "ghosty: reconcile_storage forgot {} finished torrent(s) whose content left Downloads/ (filed to Library)",
+                gone.len()
+            );
+        }
+        gone.len()
     }
 
     /// Create a `.torrent` from a local file or folder, optionally write it to `save_path`, and
@@ -1228,7 +1297,7 @@ impl Engine {
         }
         // Pausing the active download frees its slot; advance the queue.
         let max_active = *self.max_active_downloads.read().await;
-        schedule_queue(&self.session, &self.torrents, max_active).await;
+        schedule_queue(&self.session, &self.torrents, max_active, &streaming_ids(&self.hls).await).await;
         Ok(())
     }
 
@@ -1242,7 +1311,7 @@ impl Engine {
             let mut w = self.max_active_downloads.write().await;
             *w = value;
         }
-        schedule_queue(&self.session, &self.torrents, value).await;
+        schedule_queue(&self.session, &self.torrents, value, &streaming_ids(&self.hls).await).await;
     }
 
     /// Reveal the torrent's folder/file in the OS file manager.
@@ -1688,7 +1757,7 @@ async fn add_magnet(
         },
     );
     if queue {
-        schedule_queue(session, torrents, max_active_downloads).await;
+        schedule_queue(session, torrents, max_active_downloads, &std::collections::HashSet::new()).await;
     }
     Ok(id)
 }
@@ -1750,7 +1819,23 @@ fn pick_queue_releases(active: usize, max: usize, mut queued: Vec<(String, std::
 /// dead old item blocked the queue. Now each tick: (1) rotate a stalled, released download to the
 /// back and re-pause it if anything is waiting; (2) pause any excess beyond the cap; (3) release
 /// the oldest queued to fill free slots.
-async fn schedule_queue(session: &Arc<Session>, torrents: &Torrents, max_active_downloads: usize) {
+/// Infohashes that currently have a live HLS transcode job (the `hls` map keys are
+/// "{infohash}/{file}"). Such a torrent is actively feeding ffmpeg, so the scheduler must never
+/// pause it — pausing it starves ffmpeg and freezes a working stream.
+async fn streaming_ids(hls: &HlsJobs) -> std::collections::HashSet<String> {
+    hls.read()
+        .await
+        .keys()
+        .map(|k| k.split('/').next().unwrap_or(k).to_string())
+        .collect()
+}
+
+async fn schedule_queue(
+    session: &Arc<Session>,
+    torrents: &Torrents,
+    max_active_downloads: usize,
+    streaming: &std::collections::HashSet<String>,
+) {
     let now = std::time::Instant::now();
     let (to_pause, to_release): (Vec<Handle>, Vec<Handle>) = {
         let mut t = torrents.write().await;
@@ -1803,7 +1888,7 @@ async fn schedule_queue(session: &Arc<Session>, torrents: &Torrents, max_active_
         if others_waiting {
             let stalled: Vec<String> = t
                 .iter()
-                .filter(|(_, e)| e.queue_managed && !e.queued && !is_active_slot(e, now))
+                .filter(|(id, e)| e.queue_managed && !e.queued && !is_active_slot(e, now) && !streaming.contains(id.as_str()))
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in stalled {
@@ -1826,6 +1911,9 @@ async fn schedule_queue(session: &Arc<Session>, torrents: &Torrents, max_active_
         if active.len() > max_active_downloads {
             active.sort_by_key(|(_, ts)| *ts); // oldest-released first = keep running
             for (id, _) in active.iter().skip(max_active_downloads) {
+                if streaming.contains(id.as_str()) {
+                    continue; // never pause a torrent currently feeding ffmpeg
+                }
                 if let Some(e) = t.get_mut(id) {
                     e.queued = true;
                     e.released_at = None;

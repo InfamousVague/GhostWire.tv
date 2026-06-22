@@ -21,7 +21,8 @@ import {
   type AppInfo,
   type RelayStatus,
 } from "../ipc/library";
-import { circleCheck, cpu, download, film, folderDown, folderOpen, globe, hardDrive, info as infoIcon, rotateCw, server, sparkles, triangleAlert } from "../lib/icons";
+import { circleCheck, cpu, download, film, folderDown, folderOpen, globe, hardDrive, info as infoIcon, rotateCw, server, slidersVertical, sparkles, triangleAlert } from "../lib/icons";
+import { AppearanceSettings } from "./AppearanceSettings";
 import { IS_IOS } from "../lib/platform";
 import type { SettingsTab } from "../lib/settingsTabs";
 import "./Settings.css";
@@ -271,6 +272,15 @@ export function Settings({ onCatalogChanged, tab, onRunPerfPass1, onRunPerfPass2
       </div>
 
       <div className="settings-pane">
+
+      {tab === "appearance" && (
+      <Card variant="outlined" padding="lg">
+        <div className="settings-group">
+          <h4 className="settings-h"><Icon icon={slidersVertical} size="sm" /> Accent &amp; theme</h4>
+          <AppearanceSettings />
+        </div>
+      </Card>
+      )}
 
       {tab === "general" && (
       <Card variant="outlined" padding="lg">

@@ -1,32 +1,35 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { useDownloaded } from "../ipc/libraryCache";
+import { useExtNavEntries } from "../ext/slots";
 import {
-  library, search, tv, clapperboard, music, anime,
-  book, gamepad2, folderDown, settings2, users, plus,
+  library, search, film, music,
+  book, gamepad2, folderDown, settings2, users, plus, grid2x2, clock,
 } from "../lib/icons";
 
 // Tabs whose content comes from the on-disk library scan — hovering one warms the
 // shared cache so the click lands on already-loaded data.
-const LIBRARY_TABS = new Set<NavId>(["library", "movies", "tvshows", "anime", "music", "books", "games", "downloads"]);
+const LIBRARY_TABS = new Set<NavId>(["library", "videos", "movies", "tvshows", "anime", "music", "books", "games", "downloads"]);
 
 // Top-level navigation ids. The first group are content sections shown in the rail's
 // top cluster; the second are management destinations in the bottom cluster.
-// ("playlists" lives inside the Music tab now, not the rail.)
+// ("playlists" lives inside the Music tab now, not the rail. "videos" is the rail entry
+// that unifies tvshows/movies/anime — those remain valid views behind a segmented toggle.)
 export type NavId =
-  | "library" | "discover" | "tvshows" | "anime" | "movies" | "music" | "books" | "games"
-  | "playlists" | "social" | "downloads" | "export" | "automation" | "sources" | "settings";
+  | "library" | "discover" | "videos" | "tvshows" | "anime" | "movies" | "music" | "books" | "games"
+  | "playlists" | "social" | "downloads" | "watch-later" | "export" | "automation" | "sources" | "extensions" | "settings";
 
 interface RailEntry {
-  id: NavId;
+  /** A NavId for built-in destinations, or an extension view id. */
+  id: string;
   label: string;
   icon: string;
   count?: number;
 }
 
 interface NavigationRailProps {
-  active: NavId;
-  onNavigate: (id: NavId) => void;
+  active: string;
+  onNavigate: (id: string) => void;
   downloadCount?: number;
   /** Accepted for compatibility; Sources now lives under Settings, so the rail shows no badge. */
   sourceCount?: number;
@@ -41,8 +44,12 @@ export function NavigationRail({ active, onNavigate, downloadCount, onCreateShar
   const railRef = useRef<HTMLElement>(null);
   const [chipY, setChipY] = useState<number | null>(null);
   const [animated, setAnimated] = useState(false);
-  const prefetch = (id: NavId) => {
-    if (LIBRARY_TABS.has(id)) void refresh();
+  // True when the top cluster overflows and scrolls — gates the edge fade so a non-scrolling
+  // rail doesn't fade its first/last icon.
+  const [topScroll, setTopScroll] = useState(false);
+  const extNav = useExtNavEntries();
+  const prefetch = (id: string) => {
+    if (LIBRARY_TABS.has(id as NavId)) void refresh();
   };
 
   // Slide the active "chip" to whichever rail item is current. Measured from the DOM so
@@ -50,7 +57,9 @@ export function NavigationRail({ active, onNavigate, downloadCount, onCreateShar
   useLayoutEffect(() => {
     const rail = railRef.current;
     if (!rail) return;
+    const topCluster = rail.querySelector<HTMLElement>(".nav-rail__top");
     const measure = () => {
+      if (topCluster) setTopScroll(topCluster.scrollHeight > topCluster.clientHeight + 1);
       const activeEl = rail.querySelector<HTMLElement>(".nav-rail__item--active");
       if (!activeEl) { setChipY(null); return; }
       const r = activeEl.getBoundingClientRect();
@@ -60,7 +69,14 @@ export function NavigationRail({ active, onNavigate, downloadCount, onCreateShar
     const ro = new ResizeObserver(measure);
     ro.observe(rail);
     window.addEventListener("resize", measure);
-    return () => { ro.disconnect(); window.removeEventListener("resize", measure); };
+    // When the rail is too short, the top cluster scrolls — keep the active chip glued to
+    // its item as it moves, and re-check the overflow fade.
+    topCluster?.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+      topCluster?.removeEventListener("scroll", measure);
+    };
   }, [active]);
 
   // Enable the slide transition only after the first placement so the chip doesn't
@@ -73,17 +89,19 @@ export function NavigationRail({ active, onNavigate, downloadCount, onCreateShar
     { id: "library", label: "Library", icon: library },
     { id: "discover", label: "Discover", icon: search },
     { id: "music", label: "Music", icon: music },
-    { id: "tvshows", label: "TV Shows", icon: tv },
-    { id: "anime", label: "Anime", icon: anime },
-    { id: "movies", label: "Movies", icon: clapperboard },
+    // TV Shows · Movies · Anime are unified under "Videos" (segmented toggle in-view).
+    { id: "videos", label: "Videos", icon: film },
     { id: "books", label: "Books", icon: book },
     { id: "games", label: "Games", icon: gamepad2 },
+    // Watch Later sits with the content sections (right below Games), not down in the
+    // management cluster — it's a place you browse to, like the other library tabs.
+    { id: "watch-later", label: "Watch Later", icon: clock },
   ];
   const bottom: RailEntry[] = [
     { id: "social", label: "Friends", icon: users },
     { id: "downloads", label: "Downloads", icon: folderDown, count: downloadCount },
-    // Sources, AI cleanup (Automate) and Export now live as sub-pages under Settings,
-    // so the rail just carries Downloads + Settings here.
+    // Sources, AI cleanup (Automate) and Export now live as sub-pages under Settings.
+    { id: "extensions", label: "Extensions", icon: grid2x2 },
     { id: "settings", label: "Settings", icon: settings2 },
   ];
 
@@ -94,7 +112,7 @@ export function NavigationRail({ active, onNavigate, downloadCount, onCreateShar
         aria-hidden="true"
         style={chipY != null ? { transform: `translate(-50%, ${chipY}px)` } : undefined}
       />
-      <div className="nav-rail__top">
+      <div className={`nav-rail__top${topScroll ? " is-scrollable" : ""}`}>
         {top.map((e) => (
           <RailItem key={e.id} entry={e} active={active === e.id} onClick={() => onNavigate(e.id)} onHover={() => prefetch(e.id)} />
         ))}
@@ -111,7 +129,12 @@ export function NavigationRail({ active, onNavigate, downloadCount, onCreateShar
             <Icon icon={plus} size="xl" color="currentColor" />
           </button>
         )}
-        {bottom.map((e) => (
+        {/* Friends, Downloads, then any extension-contributed views, then Extensions + Settings. */}
+        {[
+          ...bottom.slice(0, 2),
+          ...extNav.map((e) => ({ id: e.id, label: e.label, icon: e.icon || grid2x2 })),
+          ...bottom.slice(2),
+        ].map((e) => (
           <RailItem key={e.id} entry={e} active={active === e.id} onClick={() => onNavigate(e.id)} onHover={() => prefetch(e.id)} />
         ))}
       </div>

@@ -125,13 +125,84 @@ fn norm(s: &str) -> String {
     s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
-/// Match each unresolved track to a local audio file under `download_dir`. Returns how many
-/// were newly resolved. Matching is by normalized title against each file's full path, with
-/// artist + album adding weight — so same-named songs in different albums resolve to their own
-/// file instead of all collapsing onto the first title match. Each file is claimed by at most
-/// one track (a genuinely repeated song falls back to sharing), which is what stops the
-/// "wrong song plays" / "duplicate gets skipped" collisions on identical filenames.
-type AudioIndexCache = Mutex<Option<(String, Instant, Arc<Vec<(String, String)>>)>>;
+/// Significant lowercase word tokens (len ≥ 2): "Mega & Dia" → ["mega","dia"]. Matching a track's
+/// artist/album against a file's *path tokens* (rather than one punctuation-stripped blob) is what
+/// survives SpotiFLAC's `--first-artist-only` folders and "&"/"feat" separators.
+fn word_tokens(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Generic words dropped from artist matching so "The Weeknd" keys on "weeknd", not "the".
+const ARTIST_STOPWORDS: &[&str] = &[
+    "the", "and", "feat", "ft", "featuring", "with", "vs", "prod", "remix", "remaster",
+    "remastered", "version", "edit",
+];
+
+/// Artist tokens worth matching on (generic words removed; falls back to all tokens if every token
+/// was generic, e.g. the band "The The").
+fn artist_match_tokens(artist: &str) -> Vec<String> {
+    let toks = word_tokens(artist);
+    let sig: Vec<String> = toks
+        .iter()
+        .filter(|t| !ARTIST_STOPWORDS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    if sig.is_empty() {
+        toks
+    } else {
+        sig
+    }
+}
+
+/// Tokens from a file's last few path components (…/artist/album/file) — what a track's metadata is
+/// matched against.
+fn file_path_tokens(abs: &str) -> Vec<String> {
+    let comps: Vec<String> = Path::new(abs)
+        .iter()
+        .filter_map(|c| c.to_str().map(|s| s.to_string()))
+        .collect();
+    let start = comps.len().saturating_sub(3);
+    let mut out = Vec::new();
+    for c in &comps[start..] {
+        out.extend(word_tokens(c));
+    }
+    out
+}
+
+/// True when a track is already linked to a file that almost certainly belongs to a *different*
+/// same-titled song: the track names an artist, but the linked file's path carries none of that
+/// artist's tokens. These are the stale mis-links the old title-only matcher produced; we re-resolve
+/// them so the correct file (or "missing") wins instead of playing the wrong song.
+fn path_artist_mismatch(track: &PlaylistTrack) -> bool {
+    let Some(path) = track.path.as_deref() else {
+        return false;
+    };
+    let artist_toks = artist_match_tokens(&track.artist);
+    if artist_toks.is_empty() {
+        return false;
+    }
+    let ftoks = file_path_tokens(path);
+    !artist_toks.iter().any(|a| ftoks.contains(a))
+}
+
+/// One indexed audio file: absolute path, its punctuation-stripped blob (for title containment),
+/// and its path tokens (for artist/album matching).
+struct AudioFile {
+    abs: String,
+    norm: String,
+    tokens: Vec<String>,
+}
+
+/// Match each unresolved track to a local audio file under `download_dir`. Returns how many were
+/// newly resolved. A file must share the track's TITLE and — crucially — its ARTIST (or album when
+/// the artist is unknown), so two different songs that happen to share a name (e.g. two "American
+/// Spirit"s) never resolve to each other's file. Each file is claimed by at most one track (a
+/// genuinely repeated song falls back to sharing).
+type AudioIndexCache = Mutex<Option<(String, Instant, Arc<Vec<AudioFile>>)>>;
 static AUDIO_INDEX: OnceLock<AudioIndexCache> = OnceLock::new();
 fn audio_index_cell() -> &'static AudioIndexCache {
     AUDIO_INDEX.get_or_init(|| Mutex::new(None))
@@ -151,7 +222,7 @@ pub fn invalidate_audio_index() {
 /// each like, reorder, or open — was walking the whole tree and freezing the UI. We memoize
 /// the scan for a short window so a burst of operations reuses one walk; library changes
 /// invalidate it eagerly (and the TTL is a backstop).
-fn audio_index(download_dir: &str) -> Arc<Vec<(String, String)>> {
+fn audio_index(download_dir: &str) -> Arc<Vec<AudioFile>> {
     const TTL: Duration = Duration::from_secs(15);
     let cell = audio_index_cell();
     if let Ok(guard) = cell.lock() {
@@ -162,11 +233,15 @@ fn audio_index(download_dir: &str) -> Arc<Vec<(String, String)>> {
         }
     }
     // Rebuild outside the lock (the scan can be slow) and then publish.
-    let files: Arc<Vec<(String, String)>> = Arc::new(
+    let files: Arc<Vec<AudioFile>> = Arc::new(
         crate::export::scan(Path::new(download_dir))
             .into_iter()
             .filter(|e| e.kind == "audio")
-            .map(|e| (e.path.clone(), norm(&e.path)))
+            .map(|e| AudioFile {
+                norm: norm(&e.path),
+                tokens: file_path_tokens(&e.path),
+                abs: e.path,
+            })
             .collect(),
     );
     if let Ok(mut guard) = cell.lock() {
@@ -179,10 +254,11 @@ pub fn resolve_paths(download_dir: &str, p: &mut Playlist) -> usize {
     // Nothing to do if every track already points at an existing file — skip the library
     // scan entirely (the common case for removing, reordering, or re-opening a playlist that
     // was resolved on a previous visit). This is what makes liking / opening feel instant.
-    let needs_scan = p
-        .tracks
-        .iter()
-        .any(|t| !t.path.as_deref().map(|x| Path::new(x).exists()).unwrap_or(false));
+    let needs_scan = p.tracks.iter().any(|t| {
+        let has_file = t.path.as_deref().map(|x| Path::new(x).exists()).unwrap_or(false);
+        // A missing file OR a stale mis-link (right title, wrong artist) needs a (re)match.
+        !has_file || path_artist_mismatch(t)
+    });
     if !needs_scan {
         return 0;
     }
@@ -194,9 +270,13 @@ pub fn resolve_paths(download_dir: &str, p: &mut Playlist) -> usize {
     // song legitimately repeats and no other match is left — see the fallback below).
     let mut claimed = vec![false; files.len()];
     for t in p.tracks.iter() {
+        // A mis-linked track gets re-resolved below, so don't reserve its (wrong) file.
+        if path_artist_mismatch(t) {
+            continue;
+        }
         if let Some(path) = t.path.as_deref() {
             if Path::new(path).exists() {
-                if let Some(i) = files.iter().position(|(abs, _)| abs == path) {
+                if let Some(i) = files.iter().position(|f| f.abs == path) {
                     claimed[i] = true;
                 }
             }
@@ -204,45 +284,63 @@ pub fn resolve_paths(download_dir: &str, p: &mut Playlist) -> usize {
     }
     let mut resolved = 0;
     for t in &mut p.tracks {
-        if t.path.as_deref().map(|x| Path::new(x).exists()).unwrap_or(false) {
+        let linked_ok = t.path.as_deref().map(|x| Path::new(x).exists()).unwrap_or(false)
+            && !path_artist_mismatch(t);
+        if linked_ok {
             continue;
         }
+        // Drop a missing or mis-linked path; re-match it from scratch below.
+        let had_path = t.path.take().is_some();
         let title = norm(&t.title);
-        if title.len() < 2 {
-            continue;
+        if title.len() >= 2 {
+            let artist_toks = artist_match_tokens(&t.artist);
+            let album_toks = word_tokens(&t.album);
+            let has_artist = !artist_toks.is_empty();
+            let has_album = !album_toks.is_empty();
+            // Score every file whose path contains the title; artist tokens count heavily, album
+            // breaks ties. Track the best unclaimed file and the best overall.
+            let mut best_free: Option<(usize, u32)> = None;
+            let mut best_any: Option<(usize, u32)> = None;
+            for (i, f) in files.iter().enumerate() {
+                if !f.norm.contains(&title) {
+                    continue;
+                }
+                let artist_hits = artist_toks.iter().filter(|a| f.tokens.contains(a)).count() as u32;
+                let album_hits = album_toks.iter().filter(|a| f.tokens.contains(a)).count() as u32;
+                // Disambiguation gate: when the artist is known, only a file whose path actually
+                // carries that artist is a valid match — otherwise a *different* song with the same
+                // title (a different "American Spirit") would be linked. Fall back to album when the
+                // artist is unknown, and to title-only when nothing else is known. A track whose
+                // artist matches nothing is left unresolved (shown missing) rather than mis-linked.
+                let eligible = if has_artist {
+                    artist_hits > 0
+                } else if has_album {
+                    album_hits > 0
+                } else {
+                    true
+                };
+                if !eligible {
+                    continue;
+                }
+                let score = 1 + artist_hits * 3 + album_hits;
+                if best_any.map_or(true, |(_, bs)| score > bs) {
+                    best_any = Some((i, score));
+                }
+                if !claimed[i] && best_free.map_or(true, |(_, bs)| score > bs) {
+                    best_free = Some((i, score));
+                }
+            }
+            if let Some((i, _)) = best_free {
+                t.path = Some(files[i].abs.clone());
+                claimed[i] = true;
+            } else if let Some((i, _)) = best_any {
+                // Every title+artist match is already claimed → a genuinely repeated song; share the
+                // best match rather than dropping it from the playlist.
+                t.path = Some(files[i].abs.clone());
+            }
         }
-        let artist = norm(&t.artist);
-        let album = norm(&t.album);
-        // Score every file whose path contains the title; artist and album each add weight so
-        // the most specific match wins. Track the best unclaimed file and the best overall.
-        let mut best_free: Option<(usize, u32)> = None;
-        let mut best_any: Option<(usize, u32)> = None;
-        for (i, (_, h)) in files.iter().enumerate() {
-            if !h.contains(&title) {
-                continue;
-            }
-            let mut score = 1u32;
-            if !artist.is_empty() && h.contains(&artist) {
-                score += 2;
-            }
-            if !album.is_empty() && h.contains(&album) {
-                score += 2;
-            }
-            if best_any.map_or(true, |(_, bs)| score > bs) {
-                best_any = Some((i, score));
-            }
-            if !claimed[i] && best_free.map_or(true, |(_, bs)| score > bs) {
-                best_free = Some((i, score));
-            }
-        }
-        if let Some((i, _)) = best_free {
-            t.path = Some(files[i].0.clone());
-            claimed[i] = true;
-            resolved += 1;
-        } else if let Some((i, _)) = best_any {
-            // Every file matching this title is already claimed → a genuinely repeated song;
-            // share the best match rather than dropping it from the playlist.
-            t.path = Some(files[i].0.clone());
+        // Count a fresh match, or a stale mis-link we cleared, so the caller persists the change.
+        if t.path.is_some() || had_path {
             resolved += 1;
         }
     }

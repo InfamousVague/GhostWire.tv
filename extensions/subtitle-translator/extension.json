@@ -1,0 +1,19 @@
+{
+  "id": "subtitle-translator",
+  "name": "Subtitle Translator",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "subtitles", "tagline": "Translate any subtitle track into your language on the fly.", "featured": true },
+  "description": "Translates subtitles into your language with LibreTranslate — fetches an English source and adds a translated track to the player's CC menu.",
+  "icon": "globe",
+  "permissions": {
+    "network": ["*"],
+    "app": ["player"],
+    "storage": true
+  },
+  "contributes": {
+    "subtitleProvider": ["translate"],
+    "settings": ["translator.config"]
+  },
+  "frontend": "index.js"
+}

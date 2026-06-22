@@ -1,0 +1,13 @@
+{
+  "id": "discord-presence",
+  "name": "Discord Presence",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "social", "tagline": "Show your friends what you're watching on Discord.", "featured": true },
+  "description": "Shows what you're watching as your Discord status (Rich Presence), via a native sidecar.",
+  "icon": "users",
+  "permissions": { "app": ["player"], "storage": true },
+  "contributes": { "settings": ["discord.config"] },
+  "frontend": "index.js",
+  "backend": { "type": "sidecar", "binName": "gw_discord_sidecar" }
+}

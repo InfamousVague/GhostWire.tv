@@ -96,6 +96,13 @@ export function socialDisconnect(): Promise<void> {
   return invoke("social_disconnect").then(() => undefined);
 }
 
+/** What this machine is currently seeding, with music tags — so "My shares" can resolve album
+ *  covers (the album cover needs album+artist, which a share's display title alone lacks). */
+export function seedingShares(): Promise<ShareItem[]> {
+  if (!IN_TAURI) return Promise.resolve([]);
+  return invoke<ShareItem[]>("seeding_shares").catch(() => []);
+}
+
 /** Mutual follows (your "friends"), with live presence. */
 export function socialFriends(): Promise<FriendPresence[]> {
   if (!IN_TAURI) return Promise.resolve([]);

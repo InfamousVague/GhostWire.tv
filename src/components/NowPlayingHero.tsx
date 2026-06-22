@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { usePlayer, usePlayerProgress } from "../ipc/player";
+import { useLyrics } from "../ipc/lyrics";
+import { LyricsPanel } from "./LyricsPanel";
 import { MusicVisualizer, VIZ_MODES, analyserSampler, useVizMode } from "./MusicVisualizer";
 import { EqPanel } from "./EqPanel";
 import { hueFromString } from "../lib/catalog";
@@ -12,6 +14,7 @@ import {
   chevronRight,
   heart,
   maximize,
+  micVocal,
   music,
   pause,
   play,
@@ -55,6 +58,8 @@ export function NowPlayingHero({ onPopOut }: { onPopOut?: () => void }) {
   // Liked state (hooks must run before any early return).
   const [likedSet, setLikedSet] = useState<Set<string>>(new Set());
   const [eqOpen, setEqOpen] = useState(false);
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const { lyrics, loading: lyricsLoading } = useLyrics(cur, progress.duration > 0 ? Math.round(progress.duration * 1000) : undefined);
   const reloadLiked = useCallback(() => {
     if (!IN_TAURI) return;
     listPlaylists().then((a) => setLikedSet(new Set((findLiked(a)?.tracks ?? []).map(trackKey)))).catch(() => {});
@@ -93,6 +98,15 @@ export function NowPlayingHero({ onPopOut }: { onPopOut?: () => void }) {
           </button>
         </div>
         <div className="np-hero-topright">
+          <button
+            className={`np-hero-iconbtn lyrics-toggle${lyricsOpen ? " on is-on" : ""}`}
+            title="Lyrics"
+            aria-label="Lyrics"
+            aria-pressed={lyricsOpen}
+            onClick={() => setLyricsOpen((v) => !v)}
+          >
+            <Icon icon={micVocal} size="sm" />
+          </button>
           <button
             className={`np-hero-iconbtn${eqOpen || p.eq.enabled ? " on" : ""}`}
             title="Equalizer"
@@ -154,6 +168,17 @@ export function NowPlayingHero({ onPopOut }: { onPopOut?: () => void }) {
           </div>
         </div>
       </div>
+
+      {lyricsOpen && (
+        <div className="np-hero-lyrics">
+          <LyricsPanel
+            lyrics={lyrics}
+            loading={lyricsLoading}
+            getActiveTime={() => p.getPosition().currentTime}
+            onSeek={p.seek}
+          />
+        </div>
+      )}
     </div>
       {eqOpen && (
         <div className="np-hero-eq">

@@ -152,6 +152,39 @@
   padding: var(--sp-2);
 }
 
+/* ---- Toggles ----
+   The kit toggles render small + near-black (hard to see, especially when off). App-wide we
+   bump them a step larger and give them the brand "ghostly green" (seafoam): a clearly-visible
+   tinted track when off, a full seafoam track when on, and a white handle throughout. The
+   `.toggle ` prefix ties the kit's size-class specificity so these win by source order. */
+.toggle .toggle__track {
+  width: 46px;
+  height: 26px;
+  /* Off: visible, not black — a soft seafoam-tinted grey so the control reads at a glance. */
+  background: color-mix(in srgb, var(--gg-seafoam) 16%, rgba(255, 255, 255, 0.14));
+  border-color: color-mix(in srgb, var(--gg-seafoam) 32%, rgba(255, 255, 255, 0.22));
+}
+.toggle .toggle__thumb {
+  width: 22px;
+  height: 22px;
+  left: 2px;
+  /* White handle with a whisper of green. */
+  background: linear-gradient(180deg, #ffffff, #eafff9);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+.toggle .toggle__input:checked + .toggle__track {
+  /* On: the full ghostly green. */
+  background: var(--gg-seafoam);
+  border-color: var(--gg-seafoam);
+}
+.toggle .toggle__input:checked + .toggle__track .toggle__thumb {
+  left: calc(100% - 24px);
+  background: #ffffff;
+}
+.toggle .toggle__input:focus-visible + .toggle__track {
+  box-shadow: 0 0 0 2px var(--gg-bg), 0 0 0 4px color-mix(in srgb, var(--gg-seafoam) 42%, transparent);
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;
@@ -291,6 +324,26 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 6px;
+}
+/* When the rail is too short to fit everything, the top cluster (content sections) scrolls and
+   fades at its edges, while the bottom cluster (Downloads / Settings / …) stays pinned and
+   fully visible. This favours always reaching the management items over the long top list. */
+.nav-rail__top {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.nav-rail__top::-webkit-scrollbar { width: 0; height: 0; display: none; }
+/* Only fade the edges when the cluster actually scrolls, so a non-overflowing rail keeps its
+   first/last icon crisp. */
+.nav-rail__top.is-scrollable {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+}
+.nav-rail__bottom {
+  flex: 0 0 auto;
 }
 .nav-rail__item {
   position: relative;
@@ -688,7 +741,11 @@ body {
   inset: 0;
   z-index: 6;
   overflow-y: auto;
-  background: #000;
+  /* Opaque (it covers the results behind it) but NOT a flat solid black — a soft seafoam glow up
+     top fading into deep black gives the movie page a cinematic, premium feel. */
+  background:
+    radial-gradient(135% 95% at 50% -12%, color-mix(in srgb, var(--gg-seafoam) 11%, transparent) 0%, transparent 56%),
+    linear-gradient(180deg, #0d0f11 0%, #070809 55%, #000 100%);
   padding: 18px 22px 92px;
 }
 
@@ -792,6 +849,91 @@ body {
 
 /* Music ↔ Playlists sub-tab toggle at the top of the Music section. */
 .music-tabbar { margin-bottom: 14px; }
+.videos-tabbar { margin-bottom: 16px; }
+
+/* ---------- Extensions marketplace ---------- */
+.ext-market { display: flex; flex-direction: column; gap: 16px; }
+.ext-market-lead { max-width: 70ch; margin: 0; line-height: 1.5; }
+.ext-market-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+}
+.ext-card-ic {
+  display: grid; place-items: center;
+  width: 42px; height: 42px; flex: none;
+  border-radius: 12px;
+  background: var(--gg-surface-2); color: var(--gg-seafoam);
+}
+.ext-market-card { display: flex; flex-direction: column; gap: 10px; height: 100%; }
+.ext-market-card-head { display: flex; align-items: center; gap: 12px; }
+.ext-market-card-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ext-market-card-name { font-weight: 600; font-size: 14px; }
+.ext-market-card-desc { margin: 0; line-height: 1.5; flex: 1; }
+.ext-market-card-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.ext-market-card-foot { margin-top: 4px; }
+.ext-market-url {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px; border-radius: 12px;
+  border: 1px dashed var(--gg-border-strong); background: var(--gg-glass);
+}
+.ext-market-url-ic { color: var(--gg-text-dim); display: inline-flex; flex: none; }
+.ext-market-url-input { flex: 1; min-width: 0; }
+
+/* ---- Extensions discovery/browse page ---- */
+.ext-browse-bar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+.ext-browse-bar .ext-market-url { flex: 1; min-width: 300px; padding: 8px 12px; }
+.ext-browse-card { cursor: pointer; }
+.ext-browse-card:focus-visible { outline: 2px solid color-mix(in srgb, var(--gg-seafoam) 60%, transparent); outline-offset: 2px; border-radius: 12px; }
+/* Lift the WHOLE card shell on hover (the outlined <Card> box), not just its inner content —
+   otherwise the content slid up inside a static frame, which read as a UI shift. Transform on the
+   outer box moves border + background + content as one unit and never reflows neighbours. */
+.ext-card-shell { transition: transform 0.12s ease, border-color 0.12s ease; will-change: transform; }
+.ext-card-shell:hover { transform: translateY(-2px); }
+.ext-detail { display: flex; flex-direction: column; gap: 14px; }
+.ext-detail-head { display: flex; align-items: center; gap: 12px; }
+.ext-detail-head .ext-market-card-title { flex: 1; min-width: 0; }
+.ext-detail-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.ext-detail-settings { padding-top: 14px; border-top: 1px solid var(--gg-border); }
+.ext-detail-foot { padding-top: 6px; }
+
+/* Category folder grid */
+.ext-folders { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+.ext-folder {
+  display: flex; align-items: center; gap: 14px; padding: 16px 18px; border-radius: 14px;
+  border: 1px solid var(--gg-border); background: var(--gg-surface);
+  cursor: pointer; text-align: left; font-family: inherit; color: var(--gg-text);
+  transition: border-color .14s ease, transform .14s ease, background .14s ease;
+}
+.ext-folder:hover { transform: translateY(-2px); border-color: var(--gg-border-strong); background: var(--gg-surface-2); }
+.ext-folder:focus-visible { outline: 2px solid color-mix(in srgb, var(--gg-seafoam) 60%, transparent); outline-offset: 2px; }
+.ext-folder:disabled { opacity: .5; cursor: default; transform: none; }
+.ext-folder-ic { display: grid; place-items: center; width: 46px; height: 46px; flex: none; border-radius: 12px; background: var(--gg-surface-2); color: var(--gg-seafoam); }
+.ext-folder-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.ext-folder-name { font-weight: 600; font-size: 15px; }
+.ext-folder-count { font-size: var(--text-xs-size); color: var(--gg-text-dim); }
+.ext-folder-chev { color: var(--gg-text-dim); display: inline-flex; flex: none; }
+.ext-folder[data-accent="violet"] .ext-folder-ic { background: color-mix(in srgb, var(--gg-violet, #a855f7) 20%, transparent); color: var(--gg-violet, #a855f7); }
+.ext-folder[data-accent="teal"]   .ext-folder-ic { background: color-mix(in srgb, var(--gg-teal) 20%, transparent); color: var(--gg-teal); }
+.ext-folder[data-accent="amber"]  .ext-folder-ic { background: color-mix(in srgb, #f5a524 20%, transparent); color: #f5a524; }
+.ext-folder[data-accent="green"]  .ext-folder-ic { background: color-mix(in srgb, #4ade80 18%, transparent); color: #4ade80; }
+.ext-folder[data-accent="accent"] .ext-folder-ic { background: color-mix(in srgb, var(--gg-seafoam) 20%, transparent); color: var(--gg-seafoam); }
+
+/* Widen the pinned scroller child so storefront cards aren't crushed to the 186px poster width. */
+.ext-rail .prow-scroller > * { flex: 0 0 320px; width: 320px; }
+
+/* Category drill-in header + back affordance */
+.ext-cat-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.ext-cat-back {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--gg-border); background: var(--gg-surface);
+  color: var(--gg-text-muted); font-family: inherit; font-size: var(--text-sm-size);
+  padding: 6px 12px 6px 8px; border-radius: 999px; cursor: pointer;
+  transition: border-color .12s ease, color .12s ease, background .12s ease;
+}
+.ext-cat-back:hover { border-color: var(--gg-border-strong); color: var(--gg-text); background: var(--gg-surface-2); }
+.ext-cat-title { display: inline-flex; align-items: center; gap: 8px; margin: 0; font-size: var(--text-lg-size); font-weight: 700; letter-spacing: -0.01em; }
+.ext-cat-title .ext-folder-count { margin-left: 4px; }
 
 /* Discover category switcher (under the hero search) — single row so the SegmentedControl's
    measured sliding indicator stays aligned. The seven short pills fit even at the min width. */
@@ -1444,7 +1586,9 @@ body {
 .source-test-sample { margin: 2px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; color: var(--gg-text-dim); }
 .source-test-sample li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 72ch; }
 
-.section-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; max-width: 920px; }
+/* Center the capped-width column within the content area so wide screens don't leave a big
+   empty band on the right. Full-bleed views (Discover/Catalog, Search) don't use .section-stack. */
+.section-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; max-width: 920px; margin-inline: auto; }
 /* Cap the single grid track at the container width so a wide child (e.g. the Music
    browse rails' max-content) can't blow the whole page out — horizontal scrollers
    then clip + scroll internally instead of overflowing. */
@@ -1655,8 +1799,13 @@ body {
 .show-meta-art img { width: 100%; height: 100%; object-fit: cover; }
 .show-meta-body { min-width: 0; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .show-meta-name { margin: 0; font-size: var(--text-xl-size); font-weight: 700; letter-spacing: -0.01em; }
-.show-meta-line { color: var(--gg-text-muted); font-size: var(--text-sm-size); }
+.show-meta-line { color: var(--gg-text-muted); font-size: var(--text-sm-size); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.show-rating { display: inline-flex; align-items: center; gap: 4px; font-weight: 700; color: var(--gg-text); }
+.show-rating > svg { color: #f5c518; }
+.show-credit { color: var(--gg-text-dim); font-size: var(--text-sm-size); }
 .show-now { color: var(--gg-accent); font-size: var(--text-sm-size); font-weight: 600; }
+/* Cast rail on the player page — reuses the .digest-cast* grid from Digest.css. */
+.show-cast { display: flex; flex-direction: column; gap: 14px; }
 .show-meta-summary {
   margin: 2px 0 6px; color: var(--gg-text-muted); font-size: var(--text-sm-size);
   line-height: 1.5; max-width: 72ch;
@@ -2406,7 +2555,7 @@ body {
 .org-progress-fill { height: 100%; background: var(--gg-accent); transition: width 0.2s ease; }
 
 /* ---- AI Automation section ---- */
-.auto-page { max-width: 860px; }
+.auto-page { max-width: 860px; margin-inline: auto; }
 .auto-page .cat-title { display: inline-flex; align-items: center; gap: 8px; }
 .auto-intro { margin: 0 0 8px; color: var(--gg-text-dim); font-size: var(--text-sm-size); line-height: 1.5; max-width: 66ch; }
 
@@ -2534,8 +2683,8 @@ body {
 .np-like:hover { color: var(--gg-hot); }
 .np-like.liked { color: var(--gg-hot); }
 .np-like.liked > svg { fill: currentColor; }
-.np-play { background: var(--gg-btn-white); color: var(--gg-bg); width: 36px; height: 36px; }
-.np-play:hover { background: var(--gg-btn-white); color: #000; }
+.np-play { background: linear-gradient(135deg, #ffffff 0%, color-mix(in srgb, var(--gg-seafoam) 55%, #ffffff) 100%); color: var(--gg-bg); width: 36px; height: 36px; }
+.np-play:hover { background: linear-gradient(135deg, #ffffff 0%, color-mix(in srgb, var(--gg-seafoam) 72%, #ffffff) 100%); color: #000; }
 
 /* Scrub row: elapsed time · full-width scrubber · remaining time. */
 .npbar-scrubrow { display: flex; align-items: center; gap: 10px; width: 100%; position: relative; z-index: 1; }
@@ -2546,7 +2695,7 @@ body {
 .np-seek-track { position: relative; height: 4px; border-radius: 2px; background: var(--gg-surface-2); }
 .np-seek-buffered { position: absolute; left: 0; top: 0; height: 100%; border-radius: 2px; background: var(--gg-border-strong); }
 .np-seek-played { position: absolute; left: 0; top: 0; height: 100%; border-radius: 2px; background: var(--gg-text); }
-.np-seek-thumb { position: absolute; top: 50%; width: 11px; height: 11px; border-radius: 50%; background: #fff; transform: translate(-50%, -50%); opacity: 0; transition: opacity 0.12s ease; }
+.np-seek-thumb { position: absolute; top: 50%; width: 11px; height: 11px; border-radius: 50%; background: var(--gg-btn-white); transform: translate(-50%, -50%); opacity: 0; transition: opacity 0.12s ease; }
 .np-seek:hover .np-seek-thumb { opacity: 1; }
 .np-seek:hover .np-seek-played { background: var(--gg-accent); }
 
@@ -2562,7 +2711,7 @@ body {
 .np-volume { display: flex; align-items: center; gap: 4px; }
 .np-vol-slider { -webkit-appearance: none; appearance: none; width: 88px; height: 14px; background: transparent; cursor: pointer; }
 .np-vol-slider::-webkit-slider-runnable-track { height: 4px; border-radius: 999px; background: linear-gradient(90deg, #ffffff, var(--gg-seafoam)) left center / var(--vol, 100%) 100% no-repeat, rgba(255, 255, 255, 0.18); }
-.np-vol-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; margin-top: -4px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); }
+.np-vol-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; margin-top: -4px; border-radius: 50%; background: var(--gg-btn-white); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); }
 
 /* The player is docked in-flow now (not floating), so content no longer needs to reserve
    space for it — keep a normal bottom gap. */
@@ -2818,3 +2967,84 @@ html, body { overscroll-behavior: none; }
   border-color: color-mix(in srgb, var(--gg-teal) 55%, transparent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--gg-teal) 16%, transparent);
 }
+
+/* ---- Lyrics panel (synced + plain) ---- */
+.lyrics-panel {
+  position: relative;
+  overflow-y: auto;
+  scrollbar-width: none;
+  /* Soft fade at the top + bottom so lines dissolve instead of hard-cutting. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14%, #000 86%, transparent 100%);
+}
+.lyrics-panel::-webkit-scrollbar { display: none; }
+.lyrics-panel--state { display: grid; place-items: center; }
+
+.lyrics-lines { display: flex; flex-direction: column; gap: 2px; padding: 32% 8px; }
+.lyric-line {
+  appearance: none;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: center;
+  font-weight: 700;
+  font-size: 20px;
+  line-height: 1.34;
+  letter-spacing: -0.01em;
+  padding: 7px 10px;
+  border-radius: 12px;
+  color: color-mix(in srgb, var(--gg-text) 34%, transparent);
+  transform: scale(0.97);
+  transition: color 0.3s ease, opacity 0.3s ease, transform 0.3s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.lyric-line.is-past { color: color-mix(in srgb, var(--gg-text) 22%, transparent); }
+.lyric-line.is-active {
+  color: var(--gg-text);
+  transform: scale(1.04);
+  text-shadow: 0 0 22px color-mix(in srgb, var(--gg-seafoam) 45%, transparent);
+}
+.lyric-line:hover { color: color-mix(in srgb, var(--gg-text) 70%, transparent); }
+.lyric-line.is-active:hover { color: var(--gg-seafoam); }
+
+.lyrics-plain { padding: 20px 12px; text-align: center; }
+.lyrics-pline { margin: 0; font-size: 16px; line-height: 1.7; color: color-mix(in srgb, var(--gg-text) 72%, transparent); }
+.lyrics-pline--gap { height: 10px; }
+
+.lyrics-empty { display: grid; justify-items: center; gap: 12px; color: var(--gg-text-dim); padding: 24px; text-align: center; }
+.lyrics-empty p { margin: 0; font-size: 14px; }
+
+.lyrics-shimmer { display: flex; flex-direction: column; gap: 16px; width: 70%; }
+.lyrics-shimmer-row {
+  height: 18px; border-radius: 8px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--gg-text) 6%, transparent), color-mix(in srgb, var(--gg-text) 14%, transparent), color-mix(in srgb, var(--gg-text) 6%, transparent));
+  background-size: 200% 100%;
+  animation: lyrics-sheen 1.4s ease-in-out infinite;
+}
+.lyrics-shimmer-row:nth-child(2n) { width: 84%; }
+.lyrics-shimmer-row:nth-child(3n) { width: 68%; }
+@keyframes lyrics-sheen { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+/* Mic toggle active state on the players. */
+.lyrics-toggle.is-on { color: var(--gg-seafoam); }
+
+/* Lyrics overlay over the now-playing hero (sits below the top control row so the mic toggle stays clickable). */
+.np-hero-lyrics {
+  position: absolute;
+  top: 58px; left: 0; right: 0; bottom: 0;
+  z-index: 2;
+  display: flex;
+  border-radius: 0 0 18px 18px;
+  background: color-mix(in srgb, var(--gg-bg) 52%, transparent);
+  backdrop-filter: blur(10px) saturate(1.1);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
+  animation: np-lyrics-in 0.22s ease;
+}
+.np-hero-lyrics .lyrics-panel { flex: 1; padding: 0 7%; }
+@keyframes np-lyrics-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* Has-lyrics indicator on music track rows. */
+.track-lyrics-ic { display: inline-flex; align-items: center; color: var(--gg-seafoam); opacity: 0.8; flex: none; }
+.track-row:hover .track-lyrics-ic { opacity: 1; }
+
+/* Toggle wrapper on extension cards — keeps flex alignment + isolates clicks from the card. */
+.ext-card-toggle { display: inline-flex; align-items: center; flex: none; }

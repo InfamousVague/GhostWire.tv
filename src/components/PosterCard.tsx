@@ -7,8 +7,9 @@ import { CATEGORY_LABEL, cleanRelease, hueFromString, seasonEpisodeLabel } from 
 import { relayPosterFor } from "../lib/relay";
 import { cachedImageUrl } from "../lib/imageCache";
 import { formatBytes, formatCount, timeAgo } from "../lib/format";
-import { circleCheck, circlePlay, copy, download as downloadIcon, film, flame, hardDrive, upload } from "../lib/icons";
+import { circleCheck, circlePlay, clock, copy, download as downloadIcon, film, flame, hardDrive, upload } from "../lib/icons";
 import { useIsShared, useShareControls } from "../ipc/shares";
+import { addToWatchLater, isInWatchLater } from "../lib/watchLater";
 import { useAppContextMenu, type MenuAction } from "./ContextMenu";
 
 function glyphFor(cat: Category): string {
@@ -40,6 +41,7 @@ function PosterCardImpl({
     if (!openMenu) return;
     const actions: MenuAction[] = [{ label: "Play", icon: circlePlay, onSelect: onPlay }];
     if (onQueue) actions.push({ label: "Add to downloads", icon: downloadIcon, onSelect: () => onQueue(false) });
+    if (!isInWatchLater(title)) actions.push({ label: "Add to Watch Later", icon: clock, onSelect: () => addToWatchLater({ title, magnet: item.magnet }) });
     actions.push(
       shared
         ? { label: "Stop sharing", icon: upload, divider: true, onSelect: () => stopSharing(item.id) }

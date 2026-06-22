@@ -277,6 +277,28 @@ pub fn read_audio_tags(
     (None, None, None, None, None, None)
 }
 
+/// Read embedded unsynced lyrics from an audio file. lofty maps ID3 `USLT`, MP4 `©lyr`, and
+/// Vorbis/FLAC `LYRICS` all to the single `ItemKey::Lyrics`, so this is uniform across formats.
+/// Returns None when the file carries no embedded lyrics. (Timed `SYLT` isn't exposed here — a
+/// sidecar `.lrc` is preferred when timed lyrics are wanted.)
+pub fn read_lyrics(path: &Path) -> Option<String> {
+    use lofty::file::TaggedFileExt;
+    use lofty::prelude::ItemKey;
+    let tf = lofty::read_from_path(path).ok()?;
+    let tag = tf.primary_tag().or_else(|| tf.first_tag())?;
+    let txt = tag.get_string(&ItemKey::Lyrics)?.trim().to_string();
+    (!txt.is_empty()).then_some(txt)
+}
+
+/// Cheap "does this track come with lyrics?" — a sidecar `<stem>.lrc` (free fs check) OR embedded
+/// lyrics. Used to light the has-lyrics icon at scan time without any network call.
+pub fn has_lyrics(path: &Path) -> bool {
+    if path.with_extension("lrc").exists() {
+        return true;
+    }
+    read_lyrics(path).is_some()
+}
+
 /// Read the file's current title/artist/album so the model has context to clean up.
 fn read_existing(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
     use lofty::file::TaggedFileExt;

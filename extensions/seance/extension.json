@@ -1,0 +1,24 @@
+{
+  "id": "seance",
+  "name": "Séance",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": {
+    "category": "sources",
+    "tagline": "Summon videos from YouTube, Vimeo, Twitch & more into your library.",
+    "featured": true
+  },
+  "description": "Paste a YouTube, Vimeo, Twitch, TikTok or Reddit link and Séance conjures the video straight into your library — pick a quality (up to best, or audio-only) and watch it materialize with live progress. Powered by yt-dlp.",
+  "icon": "tv",
+  "permissions": {
+    "network": [],
+    "app": ["library", "downloads"],
+    "storage": true
+  },
+  "contributes": {
+    "nav": ["seance"],
+    "views": ["seance"],
+    "settings": ["seance.config"]
+  },
+  "frontend": "index.js"
+}

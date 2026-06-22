@@ -320,9 +320,6 @@ export function Playlists({ openId, onOpenId, refreshKey, onChanged, onReady }: 
     const grad = `linear-gradient(160deg, hsl(${hue} 46% 32%), hsl(${(hue + 28) % 360} 40% 11%) 78%)`;
     const sourceLabel = selected.source === "spotify" ? "Spotify" : selected.source === "import" ? "Imported" : "Manual";
     const totalMs = selected.tracks.reduce((s, t) => s + (t.durationMs || 0), 0);
-    // Playlist tracks carry no embedded art, so derive a cover from the first track via the relay.
-    const coverSeed = selected.tracks.find((t) => t.album || t.title);
-    const cover = coverSeed ? relayMusicUrl(coverSeed.album || coverSeed.title, coverSeed.artist) : undefined;
     return (
       <div className="section-stack media-wide pl-detail">
         <button className="series-back" onClick={back}>
@@ -330,7 +327,7 @@ export function Playlists({ openId, onOpenId, refreshKey, onChanged, onReady }: 
         </button>
 
         <header className="pl-hero" style={{ background: grad }}>
-          <PlaylistHeroCover cover={cover} hue={hue} />
+          <PlaylistHeroCover playlist={selected} hue={hue} />
           <div className="pl-hero-info">
             <span className="pl-hero-kind">Playlist</span>
             {renaming ? (
@@ -472,16 +469,51 @@ export function Playlists({ openId, onOpenId, refreshKey, onChanged, onReady }: 
   );
 }
 
-/** Big square hero cover for the detail page: relay art when it resolves, else a tinted
- *  gradient + glyph (mirrors how the now-playing dock degrades). */
-function PlaylistHeroCover({ cover, hue }: { cover?: string; hue: number }) {
+/** Up to 4 DISTINCT album covers from a playlist's tracks (keyed by album so the mosaic shows
+ *  variety, not four covers of one album). Playlist tracks carry no embedded art, so each cover is
+ *  resolved through the artwork relay. */
+function playlistArts(playlist: Playlist): string[] {
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const t of playlist.tracks) {
+    const key = (t.album || t.title || "").toLowerCase().trim();
+    if (!key || seen.has(key)) continue;
+    const url = relayMusicUrl(t.album || t.title, t.artist);
+    if (!url) continue;
+    seen.add(key);
+    urls.push(url);
+    if (urls.length >= 4) break;
+  }
+  return urls;
+}
+
+/** One mosaic cell — drops to a tinted blank if the relay 404s, so a missing cover doesn't gap. */
+function PlCoverImg({ src }: { src: string }) {
   const [failed, setFailed] = useState(false);
-  const bg = `linear-gradient(150deg, hsl(${hue} 38% 30%), hsl(${(hue + 40) % 360} 44% 14%))`;
-  const src = cover && !failed ? cover : undefined;
+  if (failed) return <span className="pl-cell-blank" />;
+  return <img src={src} alt="" loading="lazy" onError={() => setFailed(true)} />;
+}
+
+/** A playlist's art as a 2×2 mosaic (or a single cover when there's only one album). Renders nothing
+ *  for 0 arts — the caller shows its glyph. Fills its relatively-positioned parent. */
+function PlaylistMosaic({ arts }: { arts: string[] }) {
+  if (arts.length === 0) return null;
+  const cells = arts.length === 1 ? [arts[0]] : [arts[0], arts[1], arts[2] ?? arts[0], arts[3] ?? arts[1]];
   return (
-    <div className="pl-hero-cover" style={src ? undefined : { background: bg }}>
-      {src
-        ? <img src={src} alt="" onError={() => setFailed(true)} />
+    <span className={`pl-mosaic${cells.length === 1 ? " pl-mosaic-single" : ""}`}>
+      {cells.map((src, i) => <PlCoverImg key={i} src={src} />)}
+    </span>
+  );
+}
+
+/** Big square hero cover for the detail page: a 2×2 album mosaic, else a tinted gradient + glyph. */
+function PlaylistHeroCover({ playlist, hue }: { playlist: Playlist; hue: number }) {
+  const arts = useMemo(() => playlistArts(playlist), [playlist]);
+  const bg = `linear-gradient(150deg, hsl(${hue} 38% 30%), hsl(${(hue + 40) % 360} 44% 14%))`;
+  return (
+    <div className="pl-hero-cover" style={arts.length ? undefined : { background: bg }}>
+      {arts.length
+        ? <PlaylistMosaic arts={arts} />
         : <span className="pl-hero-glyph"><Icon icon={listMusic} size="2xl" /></span>}
     </div>
   );
@@ -491,11 +523,14 @@ function PlaylistCard({ playlist, onOpen }: { playlist: Playlist; onOpen: () => 
   const downloaded = playlist.tracks.filter((t) => t.url).length;
   const hue = hueFromString(playlist.name);
   const bg = `linear-gradient(150deg, hsl(${hue} 32% 24%), hsl(${(hue + 40) % 360} 42% 13%))`;
+  const arts = useMemo(() => playlistArts(playlist), [playlist]);
 
   return (
     <button className="poster-card pl-poster-card" onClick={onOpen}>
       <span className="poster square" style={{ background: bg }}>
-        <span className="poster-glyph"><Icon icon={listMusic} size="2xl" /></span>
+        {arts.length
+          ? <PlaylistMosaic arts={arts} />
+          : <span className="poster-glyph"><Icon icon={listMusic} size="2xl" /></span>}
         <span className="poster-seed">
           <span>{downloaded}/{playlist.tracks.length}</span>
           <span className="play-badge"><Icon icon={playIcon} size="base" /></span>

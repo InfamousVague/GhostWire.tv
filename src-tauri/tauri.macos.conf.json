@@ -33,6 +33,12 @@
     ]
   },
   "bundle": {
-    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"]
+    "externalBin": [
+      "binaries/ffmpeg",
+      "binaries/ffprobe",
+      "binaries/gw_ext_sidecar",
+      "binaries/gw_discord_sidecar",
+      "binaries/gw_cast_sidecar"
+    ]
   }
 }

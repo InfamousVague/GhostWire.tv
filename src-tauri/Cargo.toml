@@ -1,9 +1,12 @@
 [package]
 name = "ghosty"
-version = "2.0.0"
+version = "2.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+# The app's main binary. Required because the crate also ships the `gw_ext_sidecar` reference
+# extension backend (src/bin/), which otherwise makes `cargo run` / `tauri dev` ambiguous.
+default-run = "ghosty"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -64,6 +67,11 @@ lofty = "0.22"
 # (H.264/HEVC video + AAC audio) by repackaging the container without re-encoding.
 matroska-demuxer = "0.7"
 sysinfo = { version = "0.38.4", default-features = false, features = ["disk"] }
+# DLNA/SSDP "cast to TV" discovery: enumerate LAN interfaces (if-addrs) and set the multicast
+# egress interface (socket2) so the M-SEARCH goes out every LAN NIC, not a VPN tunnel — which is
+# what made discovery find no devices on VPN/multi-interface machines.
+socket2 = "0.5"
+if-addrs = "0.13"
 
 # Social P2P (P1.2): Ed25519 identity for the coordination server (challenge/response
 # auth, no passwords) + a WebSocket client for live presence and friend-to-friend

@@ -608,6 +608,8 @@ export interface DownloadedItem {
   trackNo: number | null;
   /** Embedded album artwork (music only), served from loopback /art. */
   artworkUrl: string | null;
+  /** True when the track comes with lyrics (embedded tag or sidecar `.lrc`) — lights the row icon. */
+  hasLyrics?: boolean;
   sizeBytes: number;
   /** File mtime as epoch seconds — drives the "Recently added" feed. */
   addedAt: number;

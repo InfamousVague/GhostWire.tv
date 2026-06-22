@@ -7,13 +7,15 @@ import { formatBytes, formatBytesPerSec, formatCount } from "../lib/format";
 import { isAnime, parseAnimeEpisode, parseEpisode } from "../lib/media";
 import { cleanRelease } from "../lib/catalog";
 import { fetchSubtitles, IN_TAURI, listSubtitles, type SubTrack } from "../ipc/engine";
+import { usePlaybackEmit, useExtSubtitles, useRegisterPlayerControls } from "../ext/slots";
+import { recordProgress, getResumePosition } from "../lib/watchProgress";
 import { IS_IOS } from "../lib/platform";
 import { getSetting, setSetting, tvEpisodes, tvSearch, type TvEpisode, type TvShow } from "../ipc/library";
 import { animeDetail, type AnimeDetail } from "../ipc/anime";
 import { ShowPanel } from "../components/ShowPanel";
 import {
   airplay, arrowDown, arrowUp, captions, chevronLeft, gauge, maximize, minimize, music,
-  pause, play, rectangleHorizontal, search as searchIcon, users, volume2, volumeX,
+  pause, play, rectangleHorizontal, search as searchIcon, tv, users, volume2, volumeX,
 } from "../lib/icons";
 
 /** WebKit AirPlay surface on <video> (Safari/WKWebView; not in the TS DOM lib). */
@@ -68,6 +70,8 @@ export interface PlayerItem {
 
 interface PlayerProps {
   item: PlayerItem;
+  /** Stable media id (infohash, or local:<relpath>) — carried in playback events for scrobblers. */
+  id?: string;
   streamUrl?: string;
   stats?: DownloadStats;
   info?: MediaInfo | null;
@@ -87,8 +91,9 @@ function fmtContainer(c?: string | null): string {
   return c.split(",")[0].toUpperCase();
 }
 
-export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, onPlayAnimeEpisode }: PlayerProps) {
+export function Player({ item, id = "", streamUrl, stats, info, onBack, onPlayEpisode, onPlayAnimeEpisode }: PlayerProps) {
   const dlPct = Math.round((stats?.progress ?? 0) * 100);
+  const emitPlayback = usePlaybackEmit();
 
   // TV context: prefer explicit S/E (downloaded local files carry it), else parse it from
   // the release title (streams), then pull the real show metadata + episode list from TVMaze.
@@ -177,6 +182,43 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
   const hasAnime = Boolean(anime);
   const hasShow = Boolean(ep && show) && !hasAnime;
 
+  // --- playback event bus: rich context for scrobblers (Trakt etc.) ---
+  const richCtx = useMemo(() => {
+    if (anime) return { title: anime.show.name, show: anime.show.name, season: 1, episode: anime.current, year: anime.show.year ?? undefined };
+    if (ep) return { title: show?.name || ep.show, show: ep.show, season: ep.season, episode: ep.episode, year: show?.year ?? undefined };
+    return { title: cleanRelease(item.title), show: undefined, season: undefined, episode: undefined, year: undefined };
+  }, [anime, ep, show, item.title]);
+  const firePlayback = useCallback(
+    (state: "playing" | "paused" | "ended", position: number, dur: number, throttleMs?: number) => {
+      emitPlayback(
+        {
+          kind: item.kind === "audio" ? "audio" : "video",
+          state,
+          id: id || norm(item.title),
+          title: richCtx.title,
+          position,
+          duration: dur || undefined,
+          progress: dur > 0 ? Math.min(100, (position / dur) * 100) : undefined,
+          show: richCtx.show,
+          season: richCtx.season,
+          episode: richCtx.episode,
+          year: richCtx.year,
+        },
+        throttleMs ? { throttleMs } : undefined,
+      );
+      // Native Continue Watching tracking (video only; the writer debounces).
+      if (item.kind !== "audio") {
+        recordProgress({
+          id: id || norm(item.title), title: richCtx.title,
+          show: richCtx.show, season: richCtx.season, episode: richCtx.episode,
+          position, duration: dur, state,
+        });
+      }
+    },
+    [emitPlayback, item.kind, id, item.title, richCtx],
+  );
+  const resumedRef = useRef(false);
+
   // --- media source (+ HLS fallback for codecs WebKit can't decode) ---
   const [src, setSrc] = useState<string | undefined>(streamUrl);
   const triedFallback = useRef(false);
@@ -216,6 +258,15 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
     if (ep) return { title: ep.show, season: ep.season as number | null, episode: ep.episode as number | null };
     return { title: cleanRelease(item.title), season: null as number | null, episode: null as number | null };
   }, [anime, ep, item.title]);
+
+  // Extension-contributed subtitle tracks (e.g. the Subtitle Fetcher extension) for this media,
+  // merged into the player's track list + CC menu alongside the built-in sidecar/online subs.
+  const extSubQuery = useMemo(
+    () => (isAudio || !subRel ? null : { title: subQuery.title, season: subQuery.season, episode: subQuery.episode, release: item.title }),
+    [isAudio, subRel, subQuery, item.title],
+  );
+  const extSubs = useExtSubtitles(extSubQuery);
+  const allSubs = useMemo(() => [...subs, ...extSubs], [subs, extSubs]);
 
   /** Search OpenSubtitles (free, keyless) + save the best match next to the video. */
   const searchOnline = useCallback(async () => {
@@ -266,11 +317,11 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
   // user has a preference and hasn't already turned a track on this session — never forces
   // captions on someone who's chosen "off" or hasn't picked a language yet.
   useEffect(() => {
-    if (activeSub !== -1 || !prefLang || prefLang === "off" || subs.length === 0) return;
-    const idx = subs.findIndex((s) => iso3(s.lang) === prefLang);
+    if (activeSub !== -1 || !prefLang || prefLang === "off" || allSubs.length === 0) return;
+    const idx = allSubs.findIndex((s) => iso3(s.lang) === prefLang);
     if (idx >= 0) setActiveSub(idx);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subs, prefLang]);
+  }, [allSubs, prefLang]);
   // The browser only loads a VTT when its track mode isn't "disabled" — so toggle modes
   // (not the `default` attr) to switch the showing track. Re-applied when tracks/src change.
   useEffect(() => {
@@ -278,7 +329,7 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
     if (!v) return;
     const tt = v.textTracks;
     for (let i = 0; i < tt.length; i++) tt[i].mode = i === activeSub ? "showing" : "disabled";
-  }, [activeSub, subs, src]);
+  }, [activeSub, allSubs, src]);
 
   // --- custom player state ---
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -311,6 +362,24 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
   // for a stretch, WKWebView has wedged on the stream — first nudge it to re-request the current
   // position, and if that doesn't help, surface a real error instead of spinning forever.
   const stallRef = useRef({ t: 0, buf: 0, strikes: 0 });
+  // Latest transcoding + download state, read inside the interval/retry loops so they don't
+  // re-create (and reset their counters) on every 1.5s progress tick.
+  const liveRef = useRef({ transcoding, dlPct });
+  liveRef.current = { transcoding, dlPct };
+  // Playhead to restore after a stream reload — re-fetching a growing HLS playlist resets the element.
+  const reloadAtRef = useRef<number | null>(null);
+  // Re-fetch the (growing) HLS playlist and resume. Recovers a transcode that stalled because the
+  // sequential download hadn't reached the bytes ffmpeg/the playlist needed yet — instead of
+  // dead-ending on the error card. The saved position is restored in onLoadedMetadata.
+  const reloadStream = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    reloadAtRef.current = v.currentTime > 1 ? v.currentTime : null;
+    setErrored(false);
+    setBuffering(true);
+    stallRef.current.strikes = 0;
+    try { v.load(); void v.play?.()?.catch(() => {}); } catch { /* ignore */ }
+  }, []);
   useEffect(() => {
     if (!buffering) { stallRef.current.strikes = 0; return; }
     const iv = window.setInterval(() => {
@@ -326,12 +395,28 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
         // ~8s wedged: nudge WKWebView to re-request the segment at the current position.
         try { v.currentTime = Math.max(0, v.currentTime - 0.01); void v.play?.()?.catch(() => {}); } catch { /* ignore */ }
       } else if (stallRef.current.strikes >= 4) {
-        setErrored(true);
-        setBuffering(false);
+        // A transcode of a still-downloading file stalls because ffmpeg/the playlist is waiting on
+        // bytes that haven't arrived yet — NOT a dead file. Re-fetch the growing playlist and keep
+        // the "Converting…" spinner instead of giving up on the error card.
+        if (liveRef.current.transcoding && liveRef.current.dlPct < 100) {
+          reloadStream();
+        } else {
+          setErrored(true);
+          setBuffering(false);
+        }
       }
     }, 4000);
     return () => window.clearInterval(iv);
-  }, [buffering]);
+  }, [buffering, reloadStream]);
+  // If we DID land on the error card while a transcode is still downloading, keep retrying — once the
+  // download fills in the missing bytes, a reload succeeds and playback resumes on its own.
+  useEffect(() => {
+    if (!errored || !transcoding) return;
+    const iv = window.setInterval(() => {
+      if (liveRef.current.dlPct < 100) reloadStream();
+    }, 5000);
+    return () => window.clearInterval(iv);
+  }, [errored, transcoding, reloadStream]);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [vBuffered, setVBuffered] = useState(0);
@@ -346,6 +431,39 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
   const [airplaySupported, setAirplaySupported] = useState(false);
   const [airplaying, setAirplaying] = useState(false);
   const hideTimer = useRef<number | undefined>(undefined);
+  // DLNA "Cast to TV" (native, baked in from the extension) — drives the gw_cast_sidecar.
+  const [castOpen, setCastOpen] = useState(false);
+  const [castDevices, setCastDevices] = useState<{ name: string; controlUrl: string }[]>([]);
+  const [castBusy, setCastBusy] = useState(false);
+  const [castMsg, setCastMsg] = useState("");
+  const openCast = useCallback(async () => {
+    if (!IN_TAURI) return;
+    setCastOpen(true); setCastBusy(true); setCastMsg("Looking for TVs…");
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("ext_start_bundled_sidecar", { id: "dlna-cast", name: "gw_cast_sidecar" }); // idempotent
+      const res = await invoke<{ devices?: { name: string; controlUrl: string }[] }>("ext_invoke", { id: "dlna-cast", route: "discover", payload: {} });
+      const devices = res?.devices ?? [];
+      setCastDevices(devices);
+      setCastMsg(devices.length ? "" : "No DLNA TVs found on your network");
+    } catch (e) {
+      setCastMsg(`Cast failed: ${e instanceof Error ? e.message : e}`);
+    } finally { setCastBusy(false); }
+  }, []);
+  const castTo = useCallback(async (d: { name: string; controlUrl: string }) => {
+    const v = videoRef.current;
+    const playUrl = v?.currentSrc || undefined;
+    if (!playUrl) { setCastMsg("Start a video first"); return; }
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const url = await invoke<string | null>("cast_url", { url: playUrl });
+      if (!url) { setCastMsg("Couldn't build a castable URL (pair this Mac first)"); return; }
+      await invoke("ext_invoke", { id: "dlna-cast", route: "cast", payload: { controlUrl: d.controlUrl, url, title: item.show || item.title } });
+      setCastMsg(`Casting to ${d.name} ▶`);
+    } catch (e) {
+      setCastMsg(`Failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }, [item.show, item.title]);
 
   // Buffering debounce: a stall only counts as "buffering" (→ spinner + chrome) if it
   // outlasts a micro-buffer (~450ms). Brief stalls — an HLS segment boundary, a momentary
@@ -373,6 +491,7 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
     setTime(0);
     setDuration(0);
     setVBuffered(0);
+    resumedRef.current = false; // new source → allow a fresh resume-seek
     // Cancel any pending micro-buffer timer from the previous source (and on unmount).
     return () => {
       if (bufferTimer.current != null) {
@@ -393,6 +512,11 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
       setErrored(false);
       setBuffering(true);
       setSrc(src.replace("/stream/", "/hls/") + "/index.m3u8");
+    } else if (transcoding && dlPct < 100) {
+      // The HLS playlist/segment isn't ready yet because the download is still filling in — keep
+      // buffering and re-fetch shortly instead of dead-ending (the recovery effect also retries).
+      setBuffering(true);
+      window.setTimeout(() => reloadStream(), 2500);
     } else {
       setErrored(true);
       setBuffering(false);
@@ -426,10 +550,47 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
     if (v && Number.isFinite(t)) v.currentTime = t;
   }, []);
 
+  // Resume where we left off (Continue Watching): once duration is known, seek to the saved
+  // position one time. resumedRef is reset when the source changes (the [src] effect below).
+  useEffect(() => {
+    if (resumedRef.current || isAudio || duration <= 0) return;
+    resumedRef.current = true;
+    void getResumePosition(id || norm(item.title)).then((pos) => {
+      if (pos != null && pos > 30 && pos < duration - 5) seekTo(pos);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, duration, isAudio]);
+
   const nudge = useCallback((d: number) => {
     const v = media();
     if (v) v.currentTime = Math.max(0, Math.min((v.duration || 0), v.currentTime + d));
   }, []);
+
+  // Expose video controls to extensions via gw.player (PiP, sleep timer, resume, etc.).
+  useRegisterPlayerControls("video", {
+    pause: () => media()?.pause(),
+    play: () => { void media()?.play()?.catch(() => {}); },
+    seek: (s) => seekTo(s),
+    pictureInPicture: () => {
+      const v = media() as (HTMLVideoElement & { webkitSetPresentationMode?: (m: string) => void }) | null;
+      if (v?.webkitSetPresentationMode) v.webkitSetPresentationMode("picture-in-picture");
+      else void v?.requestPictureInPicture?.().catch(() => {});
+    },
+    current: () => {
+      const v = media();
+      if (!v) return null;
+      return { kind: "video", id: id || norm(item.title), title: richCtx.title, position: v.currentTime, duration: v.duration || 0, playing: !v.paused };
+    },
+    castUrl: async () => {
+      if (!IN_TAURI || !src) return null;
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        return await invoke<string | null>("cast_url", { url: src });
+      } catch {
+        return null;
+      }
+    },
+  });
 
   const changeVolume = useCallback((val: number) => {
     const v = media();
@@ -645,8 +806,9 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
               playsInline
               onClick={togglePlay}
               onError={handleError}
-              onPlay={() => setPaused(false)}
-              onPause={() => setPaused(true)}
+              onPlay={(e) => { setPaused(false); firePlayback("playing", e.currentTarget.currentTime, e.currentTarget.duration || duration); }}
+              onPause={(e) => { setPaused(true); firePlayback("paused", e.currentTarget.currentTime, e.currentTarget.duration || duration); }}
+              onEnded={(e) => firePlayback("ended", e.currentTarget.currentTime, e.currentTarget.duration || duration)}
               onWaiting={markBuffering}
               onStalled={markBuffering}
               onPlaying={clearBuffering}
@@ -656,14 +818,26 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
                 // Time is advancing while not paused ⇒ definitely playing — clear the
                 // spinner (and cancel any pending micro-buffer) even if onPlaying/onCanPlay
                 // didn't fire (WKWebView can be flaky).
-                if (!e.currentTarget.paused) clearBuffering();
+                if (!e.currentTarget.paused) {
+                  clearBuffering();
+                  // Throttled progress tick for scrobblers (~every 12s).
+                  firePlayback("playing", e.currentTarget.currentTime, e.currentTarget.duration || duration, 12000);
+                }
               }}
               onDurationChange={(e) => setDuration(Number.isFinite(e.currentTarget.duration) ? e.currentTarget.duration : 0)}
-              onLoadedMetadata={(e) => setDuration(Number.isFinite(e.currentTarget.duration) ? e.currentTarget.duration : 0)}
+              onLoadedMetadata={(e) => {
+                setDuration(Number.isFinite(e.currentTarget.duration) ? e.currentTarget.duration : 0);
+                // Restore the playhead after a recovery reload (re-fetched HLS playlist starts at 0).
+                if (reloadAtRef.current != null) {
+                  const at = reloadAtRef.current;
+                  reloadAtRef.current = null;
+                  try { e.currentTarget.currentTime = at; } catch { /* ignore */ }
+                }
+              }}
               onProgress={onProgress}
               onVolumeChange={(e) => { setVolume(e.currentTarget.volume); setMuted(e.currentTarget.muted); }}
             >
-              {subs.map((s) => (
+              {allSubs.map((s) => (
                 <track key={s.url} kind="subtitles" src={s.url} srcLang={s.lang || undefined} label={s.label} />
               ))}
             </video>
@@ -758,7 +932,7 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
                       <button className={`yt-sub-item${activeSub === -1 ? " on" : ""}`} onClick={() => { setActiveSub(-1); rememberLang("off"); setSubMenu(false); }}>
                         Off
                       </button>
-                      {subs.map((s, i) => (
+                      {allSubs.map((s, i) => (
                         <button
                           key={s.url}
                           className={`yt-sub-item${activeSub === i ? " on" : ""}`}
@@ -774,7 +948,7 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
                         <span className="yt-sub-item is-busy"><Spinner size="xs" /> Searching online…</span>
                       ) : (
                         <button className="yt-sub-item" onClick={() => void searchOnline()}>
-                          <Icon icon={searchIcon} size="xs" /> {subs.length > 0 ? "Search online again" : "Search online (free)"}
+                          <Icon icon={searchIcon} size="xs" /> {allSubs.length > 0 ? "Search online again" : "Search online (free)"}
                         </button>
                       )}
                       {subError && <span className="yt-sub-item is-muted">No subtitles found online</span>}
@@ -794,6 +968,34 @@ export function Player({ item, streamUrl, stats, info, onBack, onPlayEpisode, on
                 <button className={`yt-iconbtn${statsOpen ? " on" : ""}`} aria-label="Stats" title="Stats for nerds" onClick={() => setStatsOpen((s) => !s)}>
                   <Icon icon={gauge} size="base" />
                 </button>
+                {IN_TAURI && (
+                  <div className="yt-sub-wrap">
+                    {castOpen && (
+                      <div className="yt-sub-menu" role="menu">
+                        {castBusy ? (
+                          <span className="yt-sub-item is-busy"><Spinner size="xs" /> Scanning…</span>
+                        ) : (
+                          castDevices.map((d) => (
+                            <button key={d.controlUrl} className="yt-sub-item" onClick={() => void castTo(d)}>
+                              <Icon icon={tv} size="xs" /> {d.name}
+                            </button>
+                          ))
+                        )}
+                        {castMsg && <span className="yt-sub-item is-muted">{castMsg}</span>}
+                      </div>
+                    )}
+                    <button
+                      className="yt-iconbtn"
+                      aria-label="Cast to TV"
+                      title="Cast to TV"
+                      aria-haspopup="menu"
+                      aria-expanded={castOpen}
+                      onClick={() => (castOpen ? setCastOpen(false) : void openCast())}
+                    >
+                      <Icon icon={tv} size="base" />
+                    </button>
+                  </div>
+                )}
                 {airplaySupported && (
                   <button className={`yt-iconbtn${airplaying ? " on" : ""}`} aria-label="AirPlay" title="AirPlay" onClick={showAirplayPicker}>
                     <Icon icon={airplay} size="base" />

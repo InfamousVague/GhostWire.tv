@@ -1,0 +1,19 @@
+{
+  "id": "subtitle-fetcher",
+  "name": "Subtitle Fetcher",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "subtitles", "tagline": "Instant subtitles from OpenSubtitles, straight into the CC menu.", "featured": true },
+  "description": "Pulls subtitles from OpenSubtitles for whatever you're watching and adds them to the player's CC menu.",
+  "icon": "captions",
+  "permissions": {
+    "network": ["*.opensubtitles.org", "opensubtitles.org"],
+    "app": ["player"],
+    "storage": true
+  },
+  "contributes": {
+    "subtitleProvider": ["opensubtitles"],
+    "settings": ["subtitle-fetcher.config"]
+  },
+  "frontend": "index.js"
+}

@@ -72,9 +72,11 @@ export function cleanRelease(raw: string): string {
   return t || raw.trim();
 }
 
-/** A captured episode number that's actually a year or a video resolution, not an episode. */
+/** A captured episode number that's actually a YEAR, not an episode. Resolutions (1080/720/…) are
+ *  rejected by context instead — the parse regexes require a delimiter the "p" in "1080p" can't
+ *  satisfy — so high real episode numbers (One Piece 1000+, even 1080) are no longer mis-rejected. */
 function notAnEpisode(n: number): boolean {
-  return (n >= 1900 && n <= 2099) || n === 2160 || n === 1080 || n === 720 || n === 480 || n === 360 || n === 240;
+  return n >= 1900 && n <= 2099;
 }
 
 /**
@@ -139,6 +141,147 @@ export function seasonEpisodeLabel(raw: string): string {
   if (season == null) return ep; // bare episode — show just the episode
   if (!ep) return `Season ${season}`;
   return `S${season} · ${ep}`;
+}
+
+// ---- Format / quality / group dimensions (each returns a canonical display string) ----
+
+/** Video codec parsed from a release title, canonicalized, or null. */
+export function codecOf(title: string): string | null {
+  const t = title.toLowerCase();
+  if (/\b(?:x ?265|h\.?\s?265|hevc)\b/.test(t)) return "HEVC";
+  if (/\b(?:x ?264|h\.?\s?264|avc)\b/.test(t)) return "H.264";
+  if (/\bav1\b/.test(t)) return "AV1";
+  if (/\bvp9\b/.test(t)) return "VP9";
+  if (/\b(?:xvid|divx)\b/.test(t)) return "Xvid";
+  return null;
+}
+
+/** Source / origin parsed from a release title, canonicalized, or null. Checked most-specific first. */
+export function sourceOf(title: string): string | null {
+  const t = title.toLowerCase();
+  if (/\bremux\b/.test(t)) return "REMUX";
+  if (/\b(?:blu-?ray|bdrip|bd-?rip|brrip|bdmv|bd)\b/.test(t)) return "BluRay";
+  if (/\bweb-?dl\b/.test(t)) return "WEB-DL";
+  if (/\bweb-?rip\b/.test(t)) return "WEBRip";
+  if (/\bhdtv\b/.test(t)) return "HDTV";
+  if (/\bhdrip\b/.test(t)) return "HDRip";
+  if (/\b(?:dvdrip|dvd-?rip|dvdscr|dvd)\b/.test(t)) return "DVD";
+  if (/\bweb\b/.test(t)) return "WEB";
+  return null;
+}
+
+/** Primary audio format parsed from a release title, canonicalized, or null (most notable wins). */
+export function audioOf(title: string): string | null {
+  const t = title.toLowerCase();
+  if (/\batmos\b/.test(t)) return "Atmos";
+  if (/\btruehd\b/.test(t)) return "TrueHD";
+  if (/\bdts-?hd\b|\bdts-?x\b/.test(t)) return "DTS-HD";
+  if (/\bdts\b/.test(t)) return "DTS";
+  if (/\b(?:e-?ac-?3|ddp|dd\+)\b/.test(t)) return "DD+";
+  if (/\b(?:ac-?3|dd\s?5\.1|dolby digital)\b/.test(t)) return "DD";
+  if (/\bflac\b/.test(t)) return "FLAC";
+  if (/\baac\b/.test(t)) return "AAC";
+  if (/\bopus\b/.test(t)) return "Opus";
+  if (/\bmp3\b/.test(t)) return "MP3";
+  return null;
+}
+
+/** True when a release advertises dual-audio (sub + dub) — common + valued in anime. */
+export function isDualAudio(title: string): boolean {
+  return /\b(?:dual[-. ]?audio|multi[-. ]?audio)\b/i.test(title);
+}
+
+/** HDR / bit-depth flag parsed from a release title, canonicalized, or null. */
+export function hdrOf(title: string): string | null {
+  const t = title.toLowerCase();
+  if (/\bdolby ?vision\b|\bdovi\b|\bdv\b/.test(t)) return "Dolby Vision";
+  if (/\bhdr10\+|\bhdr10plus\b/.test(t)) return "HDR10+";
+  if (/\bhdr10\b|\bhdr\b/.test(t)) return "HDR";
+  if (/\b10-?bit\b/.test(t)) return "10-bit";
+  return null;
+}
+
+/** Release version (v2/v3 re-encode), common in anime fansubs, or null. */
+export function versionOf(title: string): number | null {
+  const m = title.match(/(?:\d|\s|\.)v([2-9])\b/i);
+  return m ? +m[1] : null;
+}
+
+/** Release / fansub group, or null. Anime groups lead in [brackets]; scene groups trail after a final hyphen. */
+export function groupOf(title: string): string | null {
+  const lead = title.match(/^\s*\[([^\]]+)\]/);
+  if (lead) {
+    const g = lead[1].trim();
+    if (g && !/^\d+$/.test(g) && !/^(?:1080p|720p|2160p|480p|4k|x26[45]|hevc|bd|web|hdtv)$/i.test(g)) return g;
+  }
+  const noExt = title.replace(/\.[a-z0-9]{2,4}$/i, "");
+  const tail = noExt.match(/-([A-Za-z0-9]{2,})\s*$/);
+  if (tail) {
+    const g = tail[1].trim();
+    if (g && !/^(?:1080p|720p|2160p|480p|x26[45]|hevc|web|dl|rip|hd)$/i.test(g)) return g;
+  }
+  return null;
+}
+
+/** A multi-episode batch — an episode range (E01–E12 / "01-12"), or an explicit "batch"/"complete". */
+export function isBatchRelease(title: string): boolean {
+  const { episode, episodeEnd } = parseSeasonEpisode(title);
+  if (episode != null && episodeEnd != null && episodeEnd > episode) return true;
+  return /\b(?:batch|complete)\b|\(\s*\d{1,3}\s*[-~]\s*\d{1,3}\s*\)/i.test(title.replace(/[._]/g, " "));
+}
+
+/** A whole-season or multi-season pack ("Season 2" with no episode, "S01-S03", "complete series"). */
+export function isSeasonPackRelease(title: string): boolean {
+  const t = title.replace(/[._]/g, " ");
+  if (/\bcomplete\s+series\b|\bseasons?\s+\d+\s*[-–]\s*\d+\b|\bs\d{1,2}\s*[-–]\s*s?\d{1,2}\b/i.test(t)) return true;
+  const { season, episode } = parseSeasonEpisode(title);
+  return season != null && episode == null;
+}
+
+/** Everything one pass can pull from a release title — the single structured view the UI reads for
+ *  episode labels, quality/format badges, filters, and per-episode matching. Composes the focused
+ *  parsers above so there is one source of truth instead of scattered ad-hoc regexes. */
+export interface ParsedRelease {
+  showName: string;
+  season: number | null;
+  episode: number | null;
+  episodeEnd: number | null;
+  /** Anime absolute episode number (set when there is an episode but no season). */
+  absoluteEpisode: number | null;
+  version: number | null;
+  isBatch: boolean;
+  isSeasonPack: boolean;
+  quality: Quality | null;
+  codec: string | null;
+  source: string | null;
+  audio: string | null;
+  dualAudio: boolean;
+  hdr: string | null;
+  group: string | null;
+  year: number | null;
+}
+
+export function parseRelease(title: string): ParsedRelease {
+  const se = parseSeasonEpisode(title);
+  const ym = title.match(/\b(?:19|20)\d{2}\b/);
+  return {
+    showName: cleanRelease(title),
+    season: se.season,
+    episode: se.episode,
+    episodeEnd: se.episodeEnd,
+    absoluteEpisode: se.season == null ? se.episode : null,
+    version: versionOf(title),
+    isBatch: isBatchRelease(title),
+    isSeasonPack: isSeasonPackRelease(title),
+    quality: qualityOf(title),
+    codec: codecOf(title),
+    source: sourceOf(title),
+    audio: audioOf(title),
+    dualAudio: isDualAudio(title),
+    hdr: hdrOf(title),
+    group: groupOf(title),
+    year: ym ? +ym[0] : null,
+  };
 }
 
 /** Stable hue derived from a string, used for placeholder poster gradients. */

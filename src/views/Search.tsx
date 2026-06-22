@@ -11,6 +11,8 @@ import { PosterRow } from "../components/PosterRow";
 import { FeaturedCarousel } from "../components/FeaturedCarousel";
 import { AnimeDiscoverRows } from "../components/AnimeDiscoverRows";
 import { DiscoverTrending } from "../components/DiscoverTrending";
+import { ExtensionDiscoverRows } from "../ext/slots";
+import { ContinueWatchingRow } from "../components/ContinueWatchingRow";
 import { useDownloaded } from "../ipc/libraryCache";
 import type { CatalogItem, Category, SortKey } from "../lib/types";
 import { isMusicImportLink, type LibraryItem, type MovieDigest } from "../ipc/library";
@@ -309,6 +311,10 @@ export function Search({
               ))}
             </PosterRow>
           )}
+          {/* Native "Continue Watching" rail (resume where you left off). */}
+          <ContinueWatchingRow onSearch={onSearch} />
+          {/* Extension-contributed Discover rows (e.g. Trakt "Up Next"). */}
+          <ExtensionDiscoverRows />
           {sections.movies.length > 0 && (
             <PosterRow title="Movies" count={sections.movies.length}>
               {sections.movies.slice(0, 24).map((it) => (

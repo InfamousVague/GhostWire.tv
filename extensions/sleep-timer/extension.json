@@ -1,0 +1,15 @@
+{
+  "id": "sleep-timer",
+  "name": "Sleep Timer",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "player", "tagline": "Drift off — playback pauses itself.", "featured": false },
+  "description": "Auto-pause playback after a set time, or at the end of the current episode.",
+  "icon": "clock",
+  "permissions": { "app": ["player"] },
+  "contributes": {
+    "settings": ["sleep.config"],
+    "commands": ["sleep.30", "sleep.60", "sleep.episode", "sleep.cancel"]
+  },
+  "frontend": "index.js"
+}

@@ -9,6 +9,7 @@ import { UpdaterSplash } from "./components/UpdaterSplash";
 import { VisualizerWindow } from "./components/VisualizerWindow";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { applyPlatformClasses, IS_TOUCH } from "./lib/platform";
+import { applySavedAccentSync } from "./lib/accent";
 import { IN_TAURI } from "./ipc/engine";
 import { installLongPressContextMenu } from "./lib/longpress";
 
@@ -39,6 +40,8 @@ import "./styles/app-background.css";
 
 // GhostWire is a dark-only app.
 document.documentElement.setAttribute("data-theme", "dark");
+// Apply the saved accent synchronously (from localStorage) so the custom color is right on first paint.
+applySavedAccentSync();
 // Tag iOS / touch so the shell can drop desktop chrome and adapt for iPad.
 applyPlatformClasses();
 // Touch devices have no right-click: bridge long-press → context menu (+ haptic).

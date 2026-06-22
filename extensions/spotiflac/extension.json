@@ -1,0 +1,23 @@
+{
+  "id": "spotiflac",
+  "name": "SpotiFLAC",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": {
+    "category": "sources",
+    "tagline": "Import lossless music from Spotify, Tidal, Apple Music, Deezer & more.",
+    "featured": true
+  },
+  "description": "Paste a Spotify, Tidal, Apple Music, Deezer, Qobuz or YouTube Music link and SpotiFLAC fetches it in lossless quality straight into your library — playlists, albums, artists and single tracks, queued in the background.",
+  "icon": "download",
+  "permissions": {
+    "network": [],
+    "app": ["library", "downloads", "search"],
+    "storage": true
+  },
+  "contributes": {
+    "settings": ["spotiflac.config"],
+    "musicImporter": ["spotiflac"]
+  },
+  "frontend": "index.js"
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type CSSProperties, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Button } from "@mattmattmattmatt/base/primitives/button/Button";
 import { Input } from "@mattmattmattmatt/base/primitives/input/Input";
@@ -12,6 +12,8 @@ import { useContextMenu, type MenuAction } from "../components/ContextMenu";
 import { AddToPlaylistMenu } from "../components/AddToPlaylistMenu";
 import { IN_TAURI } from "../ipc/engine";
 import { useCurrentTrack } from "../ipc/player";
+import { useExtensions } from "../ext/host";
+import { useMusicImporter } from "../ext/slots";
 import {
   musicSpotiFlacInstall,
   musicSpotiFlacDownload,
@@ -398,6 +400,10 @@ function prepareMusicData(items: DownloadedItem[]): PreparedMusicData {
 export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onPlaylistsChanged, mode = "browse", onImportLink, onReady }: MusicProps) {
   const currentTrack = useCurrentTrack();
   const { items: all, refresh } = useDownloaded();
+  // SpotiFLAC ships as a built-in extension; the music importer it registers gates the import UI.
+  // When the extension is disabled the importer is null and we show an "enable" CTA instead.
+  const musicImporter = useMusicImporter();
+  const { ready: extReady, setEnabled: setExtEnabled } = useExtensions();
   const [artistName, setArtistName] = useState<string | null>(null);
   const [albumKey, setAlbumKey] = useState<string | null>(null);
   const [genreName, setGenreName] = useState<string | null>(null);
@@ -1251,6 +1257,26 @@ export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onP
   }
 
   if (mode === "import") {
+    if (extReady && !musicImporter) {
+      return (
+        <div className="section-stack media-wide music-import-shell">
+          <div className="cat-header">
+            <span className="cat-title section-title music-import-title"><Icon icon={download} size="base" /> Import Music</span>
+            <span className="cat-sub">Queue tracks, albums, playlists, and artists.</span>
+          </div>
+          <div className="settings-group" style={{ display: "grid", gap: 12, justifyItems: "start", maxWidth: 540 }}>
+            <div style={{ fontWeight: 600, fontSize: 15 }}>Music importing is turned off</div>
+            <p className="field-hint" style={{ margin: 0 }}>
+              SpotiFLAC powers importing from Spotify, Tidal, Apple Music, Deezer and more. Enable the
+              SpotiFLAC extension to bring it back.
+            </p>
+            <Button variant="primary" shape="pill" icon={download} onClick={() => setExtEnabled("spotiflac", true)}>
+              Enable SpotiFLAC
+            </Button>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="section-stack media-wide music-import-shell">
         <div className="cat-header">
@@ -1502,6 +1528,7 @@ export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onP
             >
               <span className="track-no">{p.trackNo || "—"}</span>
               <span className="track-name" title={p.track}>{p.track}</span>
+              {p.item.hasLyrics && <span className="track-lyrics-ic" title="Lyrics available"><Icon icon={micVocal} size="xs" /></span>}
               <button
                 className={`track-like${trackIsLiked(p) ? " liked" : ""}`}
                 title={trackIsLiked(p) ? "Remove from Liked Songs" : "Add to Liked Songs"}
@@ -1669,6 +1696,7 @@ export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onP
                       >
                         <span className="track-no">{p.trackNo || "—"}</span>
                         <span className="track-name" title={`${p.track} · ${p.artist}`}>{`${p.track} · ${p.artist}`}</span>
+                        {p.item.hasLyrics && <span className="track-lyrics-ic" title="Lyrics available"><Icon icon={micVocal} size="xs" /></span>}
                         <button
                           className={`track-like${trackIsLiked(p) ? " liked" : ""}`}
                           title={trackIsLiked(p) ? "Remove from Liked Songs" : "Add to Liked Songs"}
@@ -1889,13 +1917,16 @@ function MusicHero({ album, onPlay, onArtist }: { album: AlbumGroup; onPlay: () 
 }
 
 function GenreTile({ genre, onClick }: { genre: GenreGroup; onClick: () => void }) {
+  // Each genre keeps its own colour, but expressed as a neon glow + equalizer bars on a moody
+  // dark-glass card (GhostWire's audio aesthetic) rather than a flat Spotify-style colour block.
   const hue = hueFromString(genre.name);
-  const bg = `linear-gradient(135deg, hsl(${hue} 52% 34%), hsl(${(hue + 55) % 360} 58% 20%))`;
   return (
-    <button className="genre-tile" style={{ background: bg }} onClick={onClick}>
+    <button className="genre-tile" style={{ "--g-hue": hue } as CSSProperties} onClick={onClick}>
+      <span className="genre-tile-glow" aria-hidden />
+      <span className="genre-tile-halftone" aria-hidden />
+      <span className="genre-tile-bars" aria-hidden><i /><i /><i /><i /><i /></span>
       <span className="genre-tile-name">{genre.name}</span>
       <span className="genre-tile-count">{genre.albums.length} album{genre.albums.length === 1 ? "" : "s"} · {genre.artistCount} artist{genre.artistCount === 1 ? "" : "s"}</span>
-      <span className="genre-tile-glyph" aria-hidden><Icon icon={disc3} size="xl" /></span>
     </button>
   );
 }

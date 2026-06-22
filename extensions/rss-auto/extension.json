@@ -1,0 +1,20 @@
+{
+  "id": "rss-auto",
+  "name": "RSS Auto-Downloader",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "sources", "tagline": "Auto-grab new releases the moment they hit your feeds.", "featured": false },
+  "description": "Watch RSS / Atom torrent feeds and auto-download new items matching your filters.",
+  "icon": "rss",
+  "permissions": {
+    "network": ["*"],
+    "app": ["downloads"],
+    "storage": true
+  },
+  "contributes": {
+    "views": ["rss-auto"],
+    "nav": ["rss-auto"],
+    "commands": ["rss-auto.poll", "rss-auto.open"]
+  },
+  "frontend": "index.js"
+}

@@ -139,7 +139,7 @@
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--gg-btn-white);
   border: none;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
   margin-left: -6px;

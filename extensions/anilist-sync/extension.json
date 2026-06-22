@@ -1,0 +1,19 @@
+{
+  "id": "anilist-sync",
+  "name": "AniList Sync",
+  "version": "1.0.0",
+  "author": "GhostWire",
+  "discovery": { "category": "sync", "tagline": "Auto-update your AniList as you binge.", "featured": true },
+  "description": "Scrobbles anime episodes you watch to your AniList list and adds a “Continue Anime” row to Discover.",
+  "icon": "star",
+  "permissions": {
+    "network": ["graphql.anilist.co"],
+    "app": ["player", "discover", "search"],
+    "storage": true
+  },
+  "contributes": {
+    "settings": ["anilist.config"],
+    "discoverRows": ["anilist-continue"]
+  },
+  "frontend": "index.js"
+}
