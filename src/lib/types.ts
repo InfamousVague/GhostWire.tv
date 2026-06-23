@@ -90,12 +90,17 @@ export interface DownloadStats {
   state: DownloadState;
   /** 0–1 overall progress. */
   progress: number;
+  /** Bytes downloaded so far / total torrent size — drives the "X of Y" readout. */
+  downloadedBytes?: number;
+  totalBytes?: number;
   /** Bytes/sec. */
   downSpeed: number;
   upSpeed: number;
   peers: number;
   /** Local URL the <video> element streams from, once playable. */
   streamUrl?: string;
+  /** The torrent engine's failure reason when `state === "error"` (absent otherwise). */
+  error?: string | null;
   /** True only for content you deliberately shared with your connections (a local seed from
    *  "Share with network" / "Create torrent"). False for downloaded torrents that are merely
    *  seeding back to the public swarm — lets the UI separate the two. */

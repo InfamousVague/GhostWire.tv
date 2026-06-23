@@ -3,7 +3,7 @@ import { Icon } from "@mattmattmattmatt/base/primitives/icon/Icon";
 import { Spinner } from "@mattmattmattmatt/base/primitives/spinner/Spinner";
 import { IN_TAURI } from "../ipc/engine";
 import { vpnStatus, type VpnStatus } from "../ipc/library";
-import { circleCheck, panelLeftClose, panelLeftOpen, shieldCheck, shieldOff, triangleAlert } from "../lib/icons";
+import { chevronLeft, chevronRight, circleCheck, panelLeftClose, panelLeftOpen, shieldCheck, shieldOff, triangleAlert } from "../lib/icons";
 import { IS_IOS } from "../lib/platform";
 import TipPopover from "./TipPopover";
 
@@ -18,12 +18,20 @@ interface OrganizeChip {
 interface TopBarProps {
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
+  /** While collapsed, hovering the toggle peeks the sidebar in a flyout (Claude-style). */
+  onToggleHoverEnter?: () => void;
+  onToggleHoverLeave?: () => void;
   /** Live organize-task status, or null when idle. */
   organize?: OrganizeChip | null;
   onOrganizeClick?: () => void;
+  /** Browser-style history navigation. */
+  onBack?: () => void;
+  onForward?: () => void;
+  canGoBack?: boolean;
+  canGoForward?: boolean;
 }
 
-export function TopBar({ sidebarCollapsed, onToggleSidebar, organize, onOrganizeClick }: TopBarProps) {
+export function TopBar({ sidebarCollapsed, onToggleSidebar, onToggleHoverEnter, onToggleHoverLeave, organize, onOrganizeClick, onBack, onForward, canGoBack, canGoForward }: TopBarProps) {
   const [vpn, setVpn] = useState<VpnStatus | null>(null);
 
   useEffect(() => {
@@ -52,12 +60,38 @@ export function TopBar({ sidebarCollapsed, onToggleSidebar, organize, onOrganize
           type="button"
           className="topbar-toggle"
           onClick={onToggleSidebar}
+          onMouseEnter={sidebarCollapsed ? onToggleHoverEnter : undefined}
+          onMouseLeave={sidebarCollapsed ? onToggleHoverLeave : undefined}
           aria-pressed={sidebarCollapsed}
           aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
           title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
         >
-          <Icon icon={sidebarCollapsed ? panelLeftOpen : panelLeftClose} size="sm" />
+          <Icon icon={sidebarCollapsed ? panelLeftOpen : panelLeftClose} size="xl" />
         </button>
+      )}
+      {!IS_IOS && (
+        <div className="topbar-nav">
+          <button
+            type="button"
+            className="topbar-navbtn"
+            onClick={onBack}
+            disabled={!canGoBack}
+            aria-label="Back"
+            title="Back"
+          >
+            <Icon icon={chevronLeft} size="xl" />
+          </button>
+          <button
+            type="button"
+            className="topbar-navbtn"
+            onClick={onForward}
+            disabled={!canGoForward}
+            aria-label="Forward"
+            title="Forward"
+          >
+            <Icon icon={chevronRight} size="xl" />
+          </button>
+        </div>
       )}
       <div className="spacer" data-tauri-drag-region />
       {!IS_IOS && organize && (

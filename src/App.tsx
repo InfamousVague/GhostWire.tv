@@ -3,6 +3,7 @@ import { SegmentedControl } from "@mattmattmattmatt/base/primitives/segmented-co
 import { Sidebar } from "./components/Sidebar";
 import { NavigationRail, type NavId } from "./components/NavigationRail";
 import { TopBar } from "./components/TopBar";
+import HalftoneCanvas from "./components/HalftoneCanvas";
 import { Library } from "./views/Library";
 import { Sources } from "./views/Sources";
 import { Downloads } from "./views/Downloads";
@@ -28,6 +29,7 @@ import { NowPlayingHero } from "./components/NowPlayingHero";
 import { VideoTabs, type VideoTab } from "./components/VideoTabs";
 import { YouTubeVideos } from "./views/YouTubeVideos";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { DvdScreensaver, useIdle } from "./components/DvdScreensaver";
 import { SyncStatusCard } from "./components/SyncStatusCard";
 import { VpnKillSwitch } from "./components/VpnKillSwitch";
 import { CreateTorrentDialog } from "./components/CreateTorrentDialog";
@@ -111,6 +113,7 @@ import {
   listMusicImports,
   removeMusicImport,
   retryMusicImport,
+  cancelMusicImport,
   onMusicImports,
   type DownloadedItem,
   type LibraryItem,
@@ -336,9 +339,44 @@ function relayPosterUrl(title: string, kind?: string): string | undefined {
 export default function App() {
   const [view, setView] = useState<AppView>("discover");
   const [prevView, setPrevView] = useState<NavId>("discover");
+  // --- Browser-style back/forward history over the main view ---
+  const [navHist, setNavHist] = useState<{ stack: AppView[]; index: number }>(() => ({ stack: ["discover"], index: 0 }));
+  const navHistRef = useRef(navHist);
+  navHistRef.current = navHist;
+  // True while we are restoring a historical view via the arrows — so the view-watcher below moves
+  // the pointer instead of branching a new trail (and truncating the forward stack).
+  const navSuppressRef = useRef(false);
+  useEffect(() => {
+    if (navSuppressRef.current) { navSuppressRef.current = false; return; }
+    setNavHist((n) => {
+      if (n.stack[n.index] === view) return n; // not a real change (initial mount / re-render)
+      const arr = [...n.stack.slice(0, n.index + 1), view].slice(-50); // drop forward trail, cap depth
+      return { stack: arr, index: arr.length - 1 };
+    });
+  }, [view]);
+  const goBack = useCallback(() => {
+    const n = navHistRef.current;
+    if (n.index <= 0) return;
+    navSuppressRef.current = true;
+    const index = n.index - 1;
+    setNavHist({ ...n, index });
+    setView(n.stack[index]);
+  }, []);
+  const goForward = useCallback(() => {
+    const n = navHistRef.current;
+    if (n.index >= n.stack.length - 1) return;
+    navSuppressRef.current = true;
+    const index = n.index + 1;
+    setNavHist({ ...n, index });
+    setView(n.stack[index]);
+  }, []);
   // Which video sub-tab the rail's "Videos" entry returns to (sticks to the last one opened).
   const [lastVideoView, setLastVideoView] = useState<VideoTab>("tvshows");
   const player = usePlayer();
+  // After a few idle minutes (no input), drift a colour-cycling DVD-style element around the screen.
+  // With a track loaded it bounces a live "now playing" card (art + visualizer + title/artist);
+  // otherwise the plain GhostWire logo. Suppressed only while watching a video (view === "player").
+  const idle = useIdle(3 * 60 * 1000, !IS_IOS && view !== "player");
   const { openWindow: openVisualizerWindow } = useVisualizerWindow(player);
   const { linkedMac } = useLinkedDevice();
   const { state: sync } = useSync();
@@ -383,8 +421,9 @@ export default function App() {
     }
     try {
       await importer.enqueue(url);
+      // Stay on the current view — the toast + the Downloads rail badge are the
+      // feedback; don't yank the user over to Downloads.
       setMusicToast("Added to downloads — importing in the background.");
-      setView("downloads");
     } catch (e) {
       setMusicToast(e instanceof Error ? e.message : String(e));
     }
@@ -460,6 +499,15 @@ export default function App() {
 
   // --- shell chrome (Libre-style nav rail + collapsible contextual sidebar) ---
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Hover-peek of the collapsed sidebar (flyout from the topbar toggle, Claude-style).
+  const [sidebarFlyoutOpen, setSidebarFlyoutOpen] = useState(false);
+  const flyoutTimer = useRef<number | undefined>(undefined);
+  const openSidebarFlyout = () => { window.clearTimeout(flyoutTimer.current); setSidebarFlyoutOpen(true); };
+  const closeSidebarFlyoutSoon = () => {
+    window.clearTimeout(flyoutTimer.current);
+    flyoutTimer.current = window.setTimeout(() => setSidebarFlyoutOpen(false), 160);
+  };
+  const closeSidebarFlyout = () => { window.clearTimeout(flyoutTimer.current); setSidebarFlyoutOpen(false); };
   const [secSort, setSecSort] = useState<SectionSort>("popularity");
   const [secGenre, setSecGenre] = useState<string | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
@@ -1208,7 +1256,8 @@ export default function App() {
     }
 
     previews.current.delete(item.id); // an explicit download is kept, not a preview
-    setView("downloads");
+    // Stay on the current view — the transfer surfaces in the Downloads rail
+    // badge (and Downloads / Library); don't navigate away on enqueue.
     if (!IN_TAURI) {
       setDownloads((d) => upsert(d, mockStats(item.id, item.title)));
       return;
@@ -1268,13 +1317,13 @@ export default function App() {
     }
   }
 
-  /** Pull a friend's share (browse/search "Get") into the one-at-a-time download queue and
-   *  jump to Downloads so the transfer is visible — a real download, not a stream preview.
-   *  `addMagnet` (the paste-a-link path) only adds an ephemeral stream PREVIEW and opens the
-   *  player, which surfaces nothing for a folder or non-media share — hence "Get did nothing". */
+  /** Pull a friend's share (browse/search "Get") into the one-at-a-time download queue —
+   *  a real download, not a stream preview. Stays on the current view; the transfer surfaces
+   *  in the Downloads rail badge (and Downloads / Library once it finishes). `addMagnet` (the
+   *  paste-a-link path) only adds an ephemeral stream PREVIEW and opens the player, which
+   *  surfaces nothing for a folder or non-media share — hence "Get did nothing". */
   async function grabShare(item: ShareItem) {
     const magnet = shareMagnet(item);
-    setView("downloads");
     if (!IN_TAURI) {
       setDownloads((d) => upsert(d, mockStats(item.infohash, item.name)));
       return;
@@ -1720,8 +1769,9 @@ export default function App() {
   // navigation (Library/Playlists/Social) or have no use for the genre filters (Downloads —
   // it lists transfers/on-disk files, which the sidebar's section filters don't apply to).
   // Music uses the same sidebar shell as the other sections (with its playlist rail embedded).
-  const hideSidebar =
-    sidebarCollapsed ||
+  // Sections that drive their own in-view navigation never show the contextual sidebar,
+  // regardless of the collapse toggle.
+  const sidebarAutoHidden =
     activeNav === "library" ||
     activeNav === "playlists" ||
     activeNav === "downloads" ||
@@ -1730,6 +1780,10 @@ export default function App() {
     activeNav === "social" ||
     activeNav === "youtube" ||
     (extViews.ids.includes(activeNav) && !extViews.sidebars.includes(activeNav));
+  const hideSidebar = sidebarCollapsed || sidebarAutoHidden;
+  // The flyout peek is only meaningful when the user explicitly collapsed a sidebar that
+  // would otherwise have content.
+  const sidebarFlyoutAvailable = sidebarCollapsed && !sidebarAutoHidden;
   // The content section to render (null while the player is open or on a non-section view).
   const activeSection = (MEDIA_SECTIONS as string[]).includes(view) ? (view as MediaSectionId) : null;
   // The section whose filters the sidebar shows (sticks to the origin section in the player).
@@ -2021,6 +2075,26 @@ export default function App() {
     return { top, bottom };
   };
 
+  // Shared once so the docked sidebar and the hover-peek flyout render identical content.
+  const sidebarProps = {
+    section: activeNav as NavId,
+    genres: sectionGenres,
+    sort: secSort,
+    onSort: setSecSort,
+    genre: secGenre,
+    onGenre: setSecGenre,
+    recents,
+    popular: POPULAR,
+    onPick: handleSearch,
+    onClearRecents: clearRecents,
+    settingsTab,
+    onSettingsTab: setSettingsTab,
+    musicPlaylistActiveId: musicTab === "playlists" ? openPlaylistId : null,
+    onOpenMusicPlaylist: (id: string) => { setOpenPlaylistId(id); setMusicTab("playlists"); },
+    musicPlaylistRefreshKey: playlistRefresh,
+    onMusicPlaylistToast: setMusicToast,
+  };
+
   return (
     <>
       <LibraryProvider>
@@ -2031,13 +2105,33 @@ export default function App() {
       <ExtMusicImporterBridge onChange={(imp) => { extMusicImporterRef.current = imp; }} />
       <ExtViewIdsBridge onChange={setExtViews} />
       <div className="app">
-      <div className="app-halftone" aria-hidden="true" />
+      {/* Corner halftone — dots drawn on a <canvas> (size-graded from the corner outward),
+          which renders the large→small falloff reliably across engines (WKWebView flattened
+          the old multi-layer CSS-mask version to uniform dots). */}
+      <HalftoneCanvas className="app-halftone" maxR={3} minR={0.26} spacing={16} />
+      {idle && <DvdScreensaver />}
       <TopBar
         sidebarCollapsed={sidebarCollapsed}
-        onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
+        onToggleSidebar={() => { setSidebarCollapsed((v) => !v); closeSidebarFlyout(); }}
+        onToggleHoverEnter={sidebarFlyoutAvailable ? openSidebarFlyout : undefined}
+        onToggleHoverLeave={sidebarFlyoutAvailable ? closeSidebarFlyoutSoon : undefined}
         organize={orgPhase === "idle" ? null : { phase: orgPhase, done: orgProgress.done, total: orgProgress.total, moved: orgResult?.moved ?? 0, changes: orgProgress.total }}
         onOrganizeClick={() => setOrgOpen((v) => !v)}
+        onBack={goBack}
+        onForward={goForward}
+        canGoBack={navHist.index > 0}
+        canGoForward={navHist.index < navHist.stack.length - 1}
       />
+      {/* Hover-peek: while collapsed, hovering the topbar toggle floats the sidebar in a flyout. */}
+      {sidebarFlyoutAvailable && sidebarFlyoutOpen && (
+        <div
+          className="sidebar-flyout"
+          onMouseEnter={openSidebarFlyout}
+          onMouseLeave={closeSidebarFlyoutSoon}
+        >
+          <Sidebar collapsed={false} {...sidebarProps} />
+        </div>
+      )}
       <div className={`app-body${hideSidebar ? " sidebar-collapsed" : ""}`}>
         <NavigationRail
           active={isVideoView(activeNav) ? "videos" : activeNav}
@@ -2047,25 +2141,7 @@ export default function App() {
           onCreateShare={IN_TAURI && !IS_IOS ? () => setShareDialogOpen(true) : undefined}
           createActive={shareDialogOpen}
         />
-        <Sidebar
-          collapsed={hideSidebar}
-          section={activeNav as NavId}
-          genres={sectionGenres}
-          sort={secSort}
-          onSort={setSecSort}
-          genre={secGenre}
-          onGenre={setSecGenre}
-          recents={recents}
-          popular={POPULAR}
-          onPick={handleSearch}
-          onClearRecents={clearRecents}
-          settingsTab={settingsTab}
-          onSettingsTab={setSettingsTab}
-          musicPlaylistActiveId={musicTab === "playlists" ? openPlaylistId : null}
-          onOpenMusicPlaylist={(id) => { setOpenPlaylistId(id); setMusicTab("playlists"); }}
-          musicPlaylistRefreshKey={playlistRefresh}
-          onMusicPlaylistToast={setMusicToast}
-        />
+        <Sidebar collapsed={hideSidebar} {...sidebarProps} />
         <main className="main">
           <div className="content">
             {view === "library" && <Library onPlayLocal={playLocal} posterFor={posterForTitle} onReady={markLibraryReady} />}
@@ -2124,7 +2200,6 @@ export default function App() {
                 ) : (
                   <Music mode="browse" onPlayLocal={playLocal} onPlayAudioCollection={playAudioCollection} onReplacePoster={setReplaceTitle} onPlaylistsChanged={() => setPlaylistRefresh((n) => n + 1)} onImportLink={importMusicLink} onReady={markMusicBrowseReady} />
                 )}
-                {musicToast && <div className="atp-toast" role="status">{musicToast}</div>}
               </>
             ) : activeSection === "movies" ? (
               <Movies onPlayLocal={playLocal} posterFor={posterForTitle} onReplacePoster={setReplaceTitle} onReady={markMoviesReady} />
@@ -2177,6 +2252,7 @@ export default function App() {
                 musicImports={musicImports}
                 onRemoveImport={(id) => { removeMusicImport(id).then(listMusicImports).then(setMusicImports).catch(() => {}); }}
                 onRetryImport={(id) => { retryMusicImport(id).catch(() => {}); }}
+                onCancelImport={(id) => { cancelMusicImport(id).then(listMusicImports).then(setMusicImports).catch(() => {}); }}
                 onRevealMusicFolder={() => { revealPath("Music").catch(() => {}); }}
                 onReady={markDownloadsReady}
               />
@@ -2235,6 +2311,9 @@ export default function App() {
                 refreshCatalog();
               }}
             />
+            {/* App-level import toast — rendered globally so the "importing in the background"
+                confirmation shows from Discover and ⌘K too, not only the Music tab. */}
+            {musicToast && <div className="atp-toast" role="status">{musicToast}</div>}
           </div>
           {digestItem && (
             <div className="digest-overlay">

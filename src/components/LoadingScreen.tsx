@@ -1,4 +1,5 @@
 import "./LoadingScreen.css";
+import HalftoneCanvas from "./HalftoneCanvas";
 
 interface LoadingScreenProps {
   /** Status line under the wordmark (e.g. "Checking for updates…"). */
@@ -25,7 +26,7 @@ export function LoadingScreen({ status, progress, fading, compact, onClick }: Lo
       role="presentation"
       onClick={onClick}
     >
-      <div className="loadscreen-halftone" aria-hidden="true" />
+      <HalftoneCanvas className="loadscreen-halftone" maxR={1.3} minR={0.18} spacing={9} />
       <div className="loadscreen-glow" aria-hidden="true" />
       <div className="loadscreen-body">
         <div className="loadscreen-mark">

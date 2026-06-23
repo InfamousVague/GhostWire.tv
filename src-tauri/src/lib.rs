@@ -3165,6 +3165,9 @@ struct MusicImportManager {
     /// Nudged whenever the queue changes; a single flusher coalesces these into throttled,
     /// off-thread persist + emit passes.
     flush: tokio::sync::Notify,
+    /// Kill-switches for in-flight imports (job id → one-shot the runner selects on). Firing one
+    /// stops the running SpotiFLAC process for that job immediately (used by `music_import_cancel`).
+    cancels: tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl MusicImportManager {
@@ -3467,6 +3470,7 @@ async fn run_music_import_job(
     manager: &Arc<MusicImportManager>,
     id: &str,
     url: &str,
+    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<u32, String> {
     let app = manager.app.clone();
 
@@ -3614,25 +3618,37 @@ async fn run_music_import_job(
     });
 
     let mut stalled = false;
+    let mut cancelled = false;
     let wait = tokio::select! {
         s = child.wait() => Some(s),
         _ = &mut kill_rx => None,
+        _ = &mut cancel_rx => { cancelled = true; None },
     };
     let status = match wait {
         Some(s) => s,
         None => {
-            // Watchdog tripped: no new track landed for MUSIC_IMPORT_STALL_SECS. Kill the hung
-            // process so its queue slot frees and the job can be retried (SpotiFLAC resumes).
-            stalled = true;
+            // Watchdog tripped (no new track for MUSIC_IMPORT_STALL_SECS) or the user cancelled:
+            // kill the process so its queue slot frees (a stall can then be retried/resumed).
+            if !cancelled {
+                stalled = true;
+            }
             let _ = child.start_kill();
             child.wait().await
         }
     };
-    if let Some(task) = stdout_task {
-        let _ = task.await;
+    // A killed SpotiFLAC can leave a grandchild (yt-dlp / ffmpeg it spawned) holding its stdout/
+    // stderr open, so these drain readers may never hit EOF. Bound the wait and abort the lingering
+    // reader so a job ALWAYS finalizes — freeing its queue slot — instead of hanging forever (the
+    // cause of playlist imports getting stuck after a stalled track or a cancel).
+    if let Some(mut task) = stdout_task {
+        if tokio::time::timeout(Duration::from_secs(3), &mut task).await.is_err() {
+            task.abort();
+        }
     }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
+    if let Some(mut task) = stderr_task {
+        if tokio::time::timeout(Duration::from_secs(3), &mut task).await.is_err() {
+            task.abort();
+        }
     }
     let _ = stop_tx.send(());
     let _ = progress_task.await;
@@ -3648,6 +3664,12 @@ async fn run_music_import_job(
         for path in mine.iter() {
             claimed.remove(path);
         }
+    }
+    // Cancelled by the user: the process is dead and any tracks already downloaded stay in the
+    // library. Stop here — the job has been (or will be) dropped from the queue.
+    if cancelled {
+        invalidate_scan(app.state::<ScanCache>().inner());
+        return Err("Canceled.".to_string());
     }
     // Files added by ANY import during this job's lifetime — lets us tell a genuine silent failure
     // (nobody downloaded anything) apart from "a concurrent import claimed this job's file".
@@ -3777,7 +3799,11 @@ async fn music_import_worker(manager: Arc<MusicImportManager>) {
         let mgr = Arc::clone(&manager);
         let slots = Arc::clone(&in_flight);
         tokio::spawn(async move {
-            let result = run_music_import_job(&mgr, &id, &url).await;
+            // Register a kill-switch for this run so `music_import_cancel` can stop it mid-download.
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            mgr.cancels.lock().await.insert(id.clone(), cancel_tx);
+            let result = run_music_import_job(&mgr, &id, &url, cancel_rx).await;
+            mgr.cancels.lock().await.remove(&id);
             {
                 let mut jobs = mgr.jobs.lock().await;
                 if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
@@ -3873,6 +3899,27 @@ async fn music_import_remove(
         jobs.retain(|j| j.id != id || j.state == "downloading");
     }
     manager.request_flush();
+    Ok(())
+}
+
+/// Cancel an import: fire its kill-switch to stop the running SpotiFLAC process (if this is the job
+/// currently downloading) and drop it from the queue. Tracks already saved for a partly-finished
+/// album stay in the library.
+#[tauri::command]
+async fn music_import_cancel(
+    manager: tauri::State<'_, Arc<MusicImportManager>>,
+    id: String,
+) -> Result<(), String> {
+    if let Some(tx) = manager.cancels.lock().await.remove(&id) {
+        let _ = tx.send(());
+    }
+    {
+        let mut jobs = manager.jobs.lock().await;
+        jobs.retain(|j| j.id != id);
+    }
+    manager.request_flush();
+    // A slot may have just freed — wake the scheduler to pull the next queued import.
+    manager.notify.notify_one();
     Ok(())
 }
 
@@ -4290,6 +4337,16 @@ async fn music_artist_albums(artist_id: i64) -> Result<Vec<music::Album>, String
 #[tauri::command]
 async fn music_album_tracks(album_id: i64) -> Result<Vec<music::Track>, String> {
     music::album_tracks(&web_client()?, album_id).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Flat song search across iTunes — powers the Music page's "find new music" feed. Keyless.
+#[tauri::command]
+async fn music_search(query: String) -> Result<Vec<music::Song>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    music::search_songs(&web_client()?, q).await.map_err(|e| format!("{e:#}"))
 }
 
 /// A YouTube trailer key for a show via TMDB (needs `tmdb_key`). Returns None if
@@ -4859,6 +4916,12 @@ fn start_library_watcher(dir: PathBuf, signal: Arc<IndexerSignal>) {
 /// up-to-date index instead of walking the disk on the foreground. After a reconcile that changed
 /// anything, it invalidates the in-memory scan cache and emits `library://changed` to refresh the
 /// UI. Runs on its own thread — the reconcile (disk walk + tag reads) is blocking.
+/// Bumped whenever the on-disk → movie/show/season classifier in `export::scan` changes in a way
+/// that should re-label EXISTING library files. On startup the indexer clears cached video rows and
+/// rebuilds them once when the stored version is older (see `start_library_indexer`).
+/// v2: folder-aware show/extras classification (season + extras folders → grouped under the show).
+const LIBRARY_CLASSIFIER_VERSION: i64 = 2;
+
 fn start_library_indexer(
     app: tauri::AppHandle,
     info: AppInfo,
@@ -4882,6 +4945,21 @@ fn start_library_indexer(
         }
     }
     std::thread::spawn(move || {
+        // One-time heal after a scanner-logic change: drop the cached VIDEO rows so the initial
+        // reconcile re-derives movie/show + series name with the current (folder-aware) classifier.
+        // Cheap — video rows carry no tag/artwork work — and runs once per classifier-version bump,
+        // so existing libraries pick up reclassified show extras without a manual rescan.
+        let cls_ver = catalog
+            .get_setting("library_classifier_version")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        if cls_ver < LIBRARY_CLASSIFIER_VERSION {
+            let _ = catalog.clear_library_files_kind("video");
+            let _ = catalog.set_setting(
+                "library_classifier_version",
+                &LIBRARY_CLASSIFIER_VERSION.to_string(),
+            );
+        }
         // Initial reconcile on launch — warms the index (or seeds it on first-ever run).
         let _ = safe_reconcile(&info, &catalog);
         invalidate_scan(&cache);
@@ -7240,6 +7318,7 @@ pub fn run() {
                 app: app.handle().clone(),
                 claimed: tokio::sync::Mutex::new(HashSet::new()),
                 flush: tokio::sync::Notify::new(),
+                cancels: tokio::sync::Mutex::new(HashMap::new()),
             });
             app.manage(import_manager.clone());
             tauri::async_runtime::spawn(async move {
@@ -7300,6 +7379,7 @@ pub fn run() {
             music_imports_clear,
             music_purge_previews,
             music_import_retry,
+            music_import_cancel,
             seance_status,
             seance_install,
             seance_download,
@@ -7312,6 +7392,7 @@ pub fn run() {
             music_search_artists,
             music_artist_albums,
             music_album_tracks,
+            music_search,
             ai_status,
             ai_scan,
             clean_titles,

@@ -199,7 +199,7 @@ export function Library({ onPlayLocal, posterFor, onReady }: LibraryProps) {
         {/* Search shares one row with the sort toggle. */}
         <div className="lib-toolbar">
           <label className="lib-searchbar">
-            <Icon icon={searchIcon} size="base" />
+            <Icon icon={searchIcon} size="lg" />
             <input
               value={q}
               onChange={(e) => setQ(e.target.value)}

@@ -224,6 +224,32 @@ body {
 /* ---------- Floating sidebar ----------
  * Floats inside 10px margins for a card-on-backdrop feel: elevated surface,
  * hairline border, soft drop shadow + inset top rim to lift it off the floor. */
+/* Hover-peek flyout: floats the collapsed sidebar as a dropdown beside the nav rail,
+   triggered by hovering the topbar toggle (Claude-desktop style). */
+.sidebar-flyout {
+  position: fixed;
+  top: 48px;
+  left: 66px;
+  bottom: 14px;
+  width: 252px;
+  z-index: 80;
+  display: flex;
+  animation: sidebar-flyout-in 0.18s cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+.sidebar-flyout .sidebar {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 28px 64px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+@keyframes sidebar-flyout-in {
+  from { opacity: 0; transform: translateX(-12px) scale(0.99); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
 .sidebar {
   width: 240px;
   flex-shrink: 0;
@@ -617,8 +643,8 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   flex-shrink: 0;
   border: 0;
   background: transparent;
@@ -918,6 +944,112 @@ body {
 .ext-folder[data-accent="amber"]  .ext-folder-ic { background: color-mix(in srgb, #f5a524 20%, transparent); color: #f5a524; }
 .ext-folder[data-accent="green"]  .ext-folder-ic { background: color-mix(in srgb, #4ade80 18%, transparent); color: #4ade80; }
 .ext-folder[data-accent="accent"] .ext-folder-ic { background: color-mix(in srgb, var(--gg-seafoam) 20%, transparent); color: var(--gg-seafoam); }
+
+/* ============================ Marketplace storefront ============================ */
+.ext-store { display: flex; flex-direction: column; gap: 18px; }
+
+/* Per-accent icon-tile tint (mirrors the folder recipe) applied to card/hero icon tiles. */
+.ext-card-ic[data-accent="violet"] { background: color-mix(in srgb, var(--gg-violet, #a855f7) 20%, transparent); color: var(--gg-violet, #a855f7); }
+.ext-card-ic[data-accent="teal"]   { background: color-mix(in srgb, var(--gg-teal) 20%, transparent); color: var(--gg-teal); }
+.ext-card-ic[data-accent="amber"]  { background: color-mix(in srgb, #f5a524 20%, transparent); color: #f5a524; }
+.ext-card-ic[data-accent="green"]  { background: color-mix(in srgb, #4ade80 18%, transparent); color: #4ade80; }
+.ext-card-ic[data-accent="accent"] { background: color-mix(in srgb, var(--gg-seafoam) 20%, transparent); color: var(--gg-seafoam); }
+
+/* Sticky control bar */
+.ext-store-bar {
+  position: sticky; top: 0; z-index: 6;
+  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 16px;
+  padding: 12px 4px; margin: 0 -4px;
+  background: color-mix(in srgb, var(--gg-surface) 90%, transparent);
+  -webkit-backdrop-filter: blur(12px) saturate(150%); backdrop-filter: blur(12px) saturate(150%);
+  border-bottom: 1px solid var(--gg-border);
+}
+.ext-store-bar-title { display: flex; flex-direction: column; gap: 1px; }
+.ext-store-bar-title h2 { margin: 0; font-size: var(--text-lg-size); font-weight: 800; letter-spacing: -0.02em; }
+.ext-store-bar-search { min-width: 0; }
+.ext-store-bar-actions { display: flex; align-items: center; gap: 10px; }
+.ext-store-installrow { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.ext-store-installrow .ext-market-url { flex: 1; min-width: 280px; padding: 8px 12px; }
+
+/* Category + sort rail */
+.ext-filterrail { display: flex; align-items: center; gap: 14px; }
+.ext-filterrail-cats { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; padding: 2px; flex: 1; }
+.ext-filterrail-cats::-webkit-scrollbar { display: none; }
+.ext-cat-chip {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; flex: none;
+  padding: 7px 13px; border-radius: 999px; font-size: var(--text-sm-size); font-weight: 600; font-family: inherit;
+  border: 1px solid var(--gg-border); background: var(--gg-surface); color: var(--gg-text-dim); cursor: pointer;
+  transition: border-color .12s ease, color .12s ease, background .12s ease;
+}
+.ext-cat-chip:hover:not(:disabled) { color: var(--gg-text); border-color: var(--gg-border-strong); }
+.ext-cat-chip.is-active { background: var(--gg-btn-white, #fff); color: var(--color-bg-primary, #0b0d0f); border-color: var(--gg-btn-white, #fff); }
+.ext-cat-chip:disabled { opacity: .4; cursor: default; }
+.ext-sort { position: relative; flex: none; }
+.ext-sort-native { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+
+/* Filtered-grid meta line */
+.ext-store-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: var(--text-xs-size); color: var(--gg-text-dim); margin-bottom: 10px; }
+.ext-store-clear { border: 0; background: none; color: var(--gg-seafoam); font: inherit; font-size: var(--text-xs-size); cursor: pointer; padding: 0; }
+.ext-store-clear:hover { text-decoration: underline; }
+.ext-store-shelves { display: flex; flex-direction: column; gap: 26px; }
+
+/* Truthful eyebrow chips */
+.ext-truth { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--gg-border); background: var(--gg-surface-2); color: var(--gg-text-dim); }
+.ext-truth--verified { color: var(--gg-seafoam); border-color: color-mix(in srgb, var(--gg-seafoam) 35%, transparent); background: color-mix(in srgb, var(--gg-seafoam) 12%, transparent); }
+
+/* Spotlight billboard */
+.ext-billboard { --bb: var(--gg-seafoam); position: relative; overflow: hidden; border-radius: 20px; border: 1px solid var(--gg-border); background: var(--gg-surface); padding: 26px 30px; min-height: 232px; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 24px; }
+.ext-billboard[data-accent="violet"] { --bb: var(--gg-violet, #a855f7); }
+.ext-billboard[data-accent="teal"]   { --bb: var(--gg-teal); }
+.ext-billboard[data-accent="amber"]  { --bb: #f5a524; }
+.ext-billboard[data-accent="green"]  { --bb: #4ade80; }
+.ext-billboard[data-accent="accent"] { --bb: var(--gg-seafoam); }
+.ext-billboard-accent { position: absolute; inset: 0; z-index: 0; background: radial-gradient(130% 150% at 10% 18%, color-mix(in srgb, var(--bb) 26%, transparent), transparent 58%); pointer-events: none; }
+.ext-billboard-body { position: relative; z-index: 1; display: flex; gap: 22px; align-items: center; min-width: 0; text-align: left; background: none; border: 0; padding: 0; color: inherit; cursor: pointer; font: inherit; }
+.ext-billboard-ic { width: 78px; height: 78px; border-radius: 18px; flex: none; }
+.ext-billboard-ic svg { width: 38px; height: 38px; }
+.ext-billboard-text { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.ext-billboard-eyebrow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ext-billboard-title { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+.ext-billboard-lead { font-size: 15px; color: var(--gg-text-dim); line-height: 1.5; max-width: 56ch; }
+.ext-billboard-highlights { display: flex; flex-wrap: wrap; gap: 5px 18px; margin-top: 3px; }
+.ext-bb-hl { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--gg-text-dim); }
+.ext-bb-hl svg { color: var(--bb); }
+.ext-billboard-actions { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 10px; align-items: stretch; min-width: 132px; }
+.ext-bb-enabled { display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-weight: 600; font-size: var(--text-sm-size); color: var(--gg-seafoam); padding: 8px; border-radius: 10px; background: color-mix(in srgb, var(--gg-seafoam) 12%, transparent); }
+.ext-bb-arrow { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2; }
+.ext-bb-arrow--l { left: 8px; }
+.ext-bb-arrow--r { right: 8px; }
+.ext-billboard-dots { position: absolute; right: 18px; bottom: 14px; z-index: 2; display: flex; gap: 6px; }
+.ext-billboard-dot { width: 7px; height: 7px; border-radius: 999px; border: 0; padding: 0; cursor: pointer; background: color-mix(in srgb, var(--gg-text) 30%, transparent); transition: background .15s ease, width .15s ease; }
+.ext-billboard-dot[aria-current="true"] { width: 18px; background: var(--bb); }
+
+/* Storefront card extras */
+.ext-store-card-shell { height: 100%; }
+.ext-store-card-shell.is-enabled { border-color: color-mix(in srgb, var(--gg-seafoam) 45%, var(--gg-border)); box-shadow: inset 2px 0 0 var(--gg-seafoam); }
+.ext-market-card-ic { position: relative; overflow: visible; }
+.ext-badge { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 999px; display: grid; place-items: center; color: #0b0d0f; border: 2px solid var(--gg-surface); }
+.ext-badge[data-kind="staffpick"] { background: #f5a524; }
+.ext-badge[data-kind="trending"] { background: #fb7185; }
+.ext-badge[data-kind="new"] { background: var(--gg-seafoam); }
+.ext-card-cta { display: inline-flex; align-items: center; flex: none; }
+.ext-cta-on { color: var(--gg-seafoam) !important; }
+.ext-card-stats { display: flex; gap: 14px; margin-top: auto; padding-top: 4px; }
+.ext-card-stats span { display: inline-flex; align-items: center; gap: 4px; }
+.ext-card-stats span:first-child svg { color: #f5a524; }
+
+/* Detail enrichments */
+.ext-detail-eyebrow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ext-detail-highlights { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ext-detail-highlights li { display: flex; align-items: center; gap: 8px; font-size: var(--text-sm-size); color: var(--gg-text); }
+.ext-detail-highlights li svg { color: var(--gg-seafoam); flex: none; }
+
+/* Responsive: stack the billboard on narrow widths */
+@media (max-width: 720px) {
+  .ext-billboard { grid-template-columns: 1fr; }
+  .ext-billboard-actions { flex-direction: row; }
+  .ext-store-bar { grid-template-columns: 1fr; }
+}
 
 /* Widen the pinned scroller child so storefront cards aren't crushed to the 186px poster width. */
 .ext-rail .prow-scroller > * { flex: 0 0 320px; width: 320px; }
@@ -3048,3 +3180,22 @@ html, body { overscroll-behavior: none; }
 
 /* Toggle wrapper on extension cards — keeps flex alignment + isolates clicks from the card. */
 .ext-card-toggle { display: inline-flex; align-items: center; flex: none; }
+
+/* Browser-style back/forward arrows in the topbar. */
+.topbar-nav { display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.topbar-navbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius-sm, 6px);
+  color: var(--gg-text-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+.topbar-navbtn:hover:not(:disabled) { background: var(--gg-surface-2); color: var(--gg-text); }
+.topbar-navbtn:disabled { opacity: 0.3; cursor: default; }

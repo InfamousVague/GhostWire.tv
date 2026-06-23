@@ -411,6 +411,11 @@ export function retryMusicImport(id: string): Promise<void> {
   return invoke("music_import_retry", { id }).then(() => undefined);
 }
 
+/** Cancel an active (or queued) import: kills the running SpotiFLAC process and drops the card. */
+export function cancelMusicImport(id: string): Promise<void> {
+  return invoke("music_import_cancel", { id }).then(() => undefined);
+}
+
 /** Subscribe to the full import-queue state whenever it changes. */
 export function onMusicImports(callback: (jobs: MusicImportJob[]) => void): Promise<() => void> {
   return listen<MusicImportJob[]>("music-imports://state", (e) => callback(e.payload));
@@ -586,6 +591,25 @@ export function musicArtistAlbums(artistId: number): Promise<MusicAlbum[]> {
 /** Every track on an album, in order, so the finder can list songs to source. */
 export function musicAlbumTracks(albumId: number): Promise<MusicTrack[]> {
   return invoke<MusicTrack[]>("music_album_tracks", { albumId });
+}
+
+export interface MusicSong {
+  id: number;
+  title: string;
+  artist: string;
+  album: string | null;
+  artwork: string | null;
+  /** 30-second preview clip (m4a), when iTunes exposes one. */
+  previewUrl: string | null;
+  /** Apple Music track link. */
+  appleUrl: string | null;
+  year: number | null;
+  durationMs: number;
+}
+
+/** Flat "find new music" song search across the keyless iTunes catalog. */
+export function musicSearch(query: string): Promise<MusicSong[]> {
+  return invoke<MusicSong[]>("music_search", { query });
 }
 
 // ---- local Library (content downloaded to disk) ----

@@ -172,8 +172,31 @@ export interface ExtManifest {
   /** `binName` is the bundled sidecar binary (resolved next to the app); the host starts it on
    *  activation and proxies gw.invoke() to it. */
   backend?: { type: "js" | "sidecar"; entry?: string; binName?: string; bin?: Record<string, string> };
-  /** Discovery/marketplace metadata for the browse page (category slug + card copy). */
-  discovery?: { category?: ExtCategory; tagline?: string; featured?: boolean };
+  /** Discovery/marketplace metadata for the storefront. All fields are optional — the UI degrades
+   *  silently when one is unset (that's the honesty guarantee; a missing stat is never rendered as 0).
+   *  First-party defaults are curated in the Extensions page's MARKET_META table and merged under
+   *  whatever a manifest declares here, so third-party manifests can carry their own. */
+  discovery?: {
+    category?: ExtCategory;
+    tagline?: string;
+    featured?: boolean;
+    /** Freeform aboutness keywords, widens search recall (descriptive, not promotional). */
+    tags?: string[];
+    /** Curated install count — orders the Trending shelf + Popular sort; omitted (never 0) when unknown. */
+    installs?: number;
+    /** ISO date of the last meaningful update — drives the "New & updated" shelf + Recent sort. */
+    updated?: string;
+    /** Curated quality signal 0–5 for the star micro-stat + Top-rated sort; undefined sorts last. */
+    rating?: number;
+    /** Editorial flag for the "Staff picks" shelf. */
+    staffPick?: boolean;
+    /** 2–4 short truthful capability bullets, shown in the hero + detail. */
+    highlights?: string[];
+    /** Per-ext accent (defaults to the category accent); maps to the existing data-accent tints. */
+    accent?: "teal" | "violet" | "amber" | "green" | "accent";
+    /** Verified publisher badge (defaults true for author "GhostWire"). */
+    verified?: boolean;
+  };
 }
 
 /** Browse categories for the Extensions discovery page (lowercase slugs are the stable keys). */

@@ -143,10 +143,17 @@ pub struct DownloadStats {
     title: String,
     state: String,
     progress: f64,
+    /// Bytes downloaded so far + the torrent's total size, so the UI can show a concrete
+    /// "X of Y" readout that visibly advances even while the rounded percentage still reads 0%.
+    downloaded_bytes: u64,
+    total_bytes: u64,
     down_speed: u64,
     up_speed: u64,
     peers: u32,
     stream_url: Option<String>,
+    /// The torrent engine's failure reason when `state == "error"` (else None), so the UI can
+    /// explain a failed download instead of showing a bare "Error" chip.
+    error: Option<String>,
     /// True ONLY for content the user deliberately put up to share with their connections —
     /// a local seed created via "Share with network" / "Create torrent". False for downloaded
     /// torrents that are merely seeding back to the public swarm. Serialized as `shared` so the
@@ -1474,10 +1481,13 @@ async fn build_snapshot(torrents: &Torrents, pending: &PendingAdds, ffmpeg_on: b
             title: p.title.clone(),
             state: "queued".to_string(),
             progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: 0,
             down_speed: 0,
             up_speed: 0,
             peers: 0,
             stream_url: None,
+            error: None,
             is_seed: false,
         });
     }
@@ -1578,11 +1588,14 @@ fn stats_of(id: &str, e: &Entry, ffmpeg_on: bool) -> DownloadStats {
         title: e.title.clone(),
         state: state.to_string(),
         progress,
+        downloaded_bytes: s.progress_bytes,
+        total_bytes: s.total_bytes,
         down_speed: down,
         up_speed: up,
         peers,
         stream_url: matches!(s.state, librqbit::TorrentStatsState::Live)
             .then(|| play_url(ffmpeg_on, id, file, name.as_deref())),
+        error: (state == "error").then(|| s.error.clone()).flatten(),
         is_seed: e.is_seed,
     }
 }

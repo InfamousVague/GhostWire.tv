@@ -1,0 +1,266 @@
+/* Full-screen DVD-style bouncing-logo screensaver. The frost lives on the separate `.dvd-blur`
+   layer below (so it can be spotlight-masked); this is just the fixed, click-to-dismiss container. */
+.dvd-saver {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  overflow: hidden;
+  cursor: none;
+  animation: dvd-saver-in 0.6s ease both;
+}
+@keyframes dvd-saver-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* The frosted glass sheet: translucent dark tint over a heavy backdrop blur so the app shows
+   through, softened. Sits BEHIND the bouncing element (its own layer, never masking the logo).
+   A radial mask centred on the logo (--spot-x/y, radius --spot-r, updated each frame) thins the
+   layer's coverage there — lower alpha = less frost = the app reads a bit sharper + brighter,
+   a soft "blur spotlight" that drifts with the bounce. Full frost everywhere outside the spot. */
+.dvd-blur {
+  position: absolute;
+  inset: 0;
+  background: rgba(7, 8, 11, 0.46);
+  -webkit-backdrop-filter: blur(40px) saturate(125%);
+  backdrop-filter: blur(40px) saturate(125%);
+  --spot-x: 50%;
+  --spot-y: 50%;
+  --spot-r: 240px;
+  -webkit-mask: radial-gradient(
+    circle var(--spot-r) at var(--spot-x) var(--spot-y),
+    rgba(0, 0, 0, 0.55) 0%,
+    rgba(0, 0, 0, 0.62) 24%,
+    rgba(0, 0, 0, 0.86) 55%,
+    rgba(0, 0, 0, 1) 80%
+  );
+  mask: radial-gradient(
+    circle var(--spot-r) at var(--spot-x) var(--spot-y),
+    rgba(0, 0, 0, 0.55) 0%,
+    rgba(0, 0, 0, 0.62) 24%,
+    rgba(0, 0, 0, 0.86) 55%,
+    rgba(0, 0, 0, 1) 80%
+  );
+  will-change: mask, -webkit-mask;
+}
+
+/* Layer that holds the bouncing element. The screen-glitch shake animates THIS (the element's
+   own transform is driven imperatively by the bounce rAF, so a CSS transform here composes with
+   it instead of fighting it). Fills the sheet, so it's also the bounce element's positioning box. */
+.dvd-stage {
+  position: absolute;
+  inset: 0;
+}
+
+.dvd-logo {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 16px;
+  will-change: transform, color, filter;
+  /* Base glow rides currentColor (the cycling colour set inline). Kept in CSS so the glitch
+     keyframe can take the `filter` over for the chromatic-aberration split. */
+  filter: drop-shadow(0 0 28px currentColor) drop-shadow(0 0 70px currentColor);
+  /* Smoothly cross-fade the colour + glow on each bounce instead of hard-cutting. */
+  transition: color 0.45s ease, filter 0.45s ease;
+}
+.dvd-logo svg { width: 56px; height: 56px; }
+.dvd-wordmark {
+  font-weight: 800;
+  font-style: italic;
+  font-size: 30px;
+  letter-spacing: 0.06em;
+  line-height: 1;
+}
+/* ".TV" suffix — a touch lighter so the brand reads first. Rides the same cycling currentColor. */
+.dvd-tld {
+  opacity: 0.7;
+  font-weight: 700;
+}
+
+/* ---- "Now playing" card (shown while a track is loaded) ----
+   Same bouncing element as .dvd-logo, but a glass card carrying the album art, a live
+   visualizer, and the title/artist. The cycling colour drives the glow via currentColor. */
+.dvd-np {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 280px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 20px;
+  border-radius: 22px;
+  background: rgba(12, 14, 17, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  backdrop-filter: blur(14px) saturate(150%);
+  will-change: transform, color, filter;
+  /* Base glow rides currentColor; the glitch keyframe takes `filter` over on each bounce. */
+  filter: drop-shadow(0 0 30px currentColor) drop-shadow(0 0 80px currentColor);
+  /* Cross-fade the glow on each bounce rather than hard-cutting. */
+  transition: color 0.45s ease, filter 0.45s ease;
+}
+.dvd-np-art {
+  width: 200px;
+  height: 200px;
+  border-radius: 16px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 12px 44px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+.dvd-np-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.dvd-np-art svg { width: 64px; height: 64px; }
+/* The shared MusicVisualizer renders into this canvas strip under the art. */
+.dvd-np-viz {
+  width: 100%;
+  height: 50px;
+  display: block;
+}
+.dvd-np-meta {
+  width: 100%;
+  text-align: center;
+}
+.dvd-np-title {
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1.25;
+  color: #f3f4f8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dvd-np-artist {
+  margin-top: 3px;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.62);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ===========================================================================
+   Glitch burst — fired (via the `.dvd-glitching` class on `.dvd-saver`) on every
+   edge bounce. Three layered effects, all ~340ms, all auto-replayed each hit:
+     1. chromatic aberration — RGB-split drop-shadows on the bouncing element
+     2. shake — a quick horizontal jitter of the whole stage
+     3. screen glitch — scanline flash + colour "tear" bands across the sheet
+   =========================================================================== */
+
+/* 1 — Chromatic aberration on whichever element is bouncing. Keyframes 0%/100% match each
+   element's resting glow so there's no pop at the seams; the middle frames split red/cyan. */
+.dvd-glitching .dvd-logo { animation: dvd-chroma 0.34s linear 1; }
+.dvd-glitching .dvd-np { animation: dvd-chroma-np 0.34s linear 1; }
+
+@keyframes dvd-chroma {
+  0%   { filter: drop-shadow(0 0 28px currentColor) drop-shadow(0 0 70px currentColor); }
+  18%  { filter: drop-shadow(-6px 0 rgba(255, 0, 90, 0.9)) drop-shadow(6px 0 rgba(0, 225, 255, 0.9)) drop-shadow(0 0 30px currentColor); }
+  37%  { filter: drop-shadow(7px 0 rgba(255, 0, 90, 0.85)) drop-shadow(-7px 0 rgba(0, 225, 255, 0.85)) drop-shadow(0 0 26px currentColor); }
+  58%  { filter: drop-shadow(-4px 0 rgba(255, 0, 90, 0.8)) drop-shadow(4px 0 rgba(0, 225, 255, 0.8)) drop-shadow(0 0 30px currentColor); }
+  78%  { filter: drop-shadow(2px 0 rgba(255, 0, 90, 0.55)) drop-shadow(-2px 0 rgba(0, 225, 255, 0.55)) drop-shadow(0 0 60px currentColor); }
+  100% { filter: drop-shadow(0 0 28px currentColor) drop-shadow(0 0 70px currentColor); }
+}
+@keyframes dvd-chroma-np {
+  0%   { filter: drop-shadow(0 0 30px currentColor) drop-shadow(0 0 80px currentColor); }
+  18%  { filter: drop-shadow(-7px 0 rgba(255, 0, 90, 0.9)) drop-shadow(7px 0 rgba(0, 225, 255, 0.9)) drop-shadow(0 0 32px currentColor); }
+  37%  { filter: drop-shadow(8px 0 rgba(255, 0, 90, 0.85)) drop-shadow(-8px 0 rgba(0, 225, 255, 0.85)) drop-shadow(0 0 28px currentColor); }
+  58%  { filter: drop-shadow(-5px 0 rgba(255, 0, 90, 0.8)) drop-shadow(5px 0 rgba(0, 225, 255, 0.8)) drop-shadow(0 0 32px currentColor); }
+  78%  { filter: drop-shadow(3px 0 rgba(255, 0, 90, 0.55)) drop-shadow(-3px 0 rgba(0, 225, 255, 0.55)) drop-shadow(0 0 70px currentColor); }
+  100% { filter: drop-shadow(0 0 30px currentColor) drop-shadow(0 0 80px currentColor); }
+}
+
+/* 2 — Stage shake (composes with the bounce element's own imperative transform). */
+.dvd-glitching .dvd-stage { animation: dvd-shake 0.34s steps(2, end) 1; }
+@keyframes dvd-shake {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  15% { transform: translate3d(-5px, 1px, 0); }
+  30% { transform: translate3d(6px, -1px, 0); }
+  45% { transform: translate3d(-4px, 0, 0); }
+  60% { transform: translate3d(3px, 1px, 0); }
+  80% { transform: translate3d(-2px, 0, 0); }
+}
+
+/* 3 — Screen-glitch overlay. Idle: invisible. On a bounce: a scanline flash plus two colour
+   "tear" bands that jump horizontally — sells a digital screen tear over the glass sheet. */
+.dvd-glitch-fx {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.16) 3px,
+    rgba(0, 0, 0, 0) 4px
+  );
+  mix-blend-mode: overlay;
+}
+.dvd-glitch-fx::before,
+.dvd-glitch-fx::after {
+  content: "";
+  position: absolute;
+  left: -10%;
+  right: -10%;
+  height: 13%;
+  opacity: 0;
+  mix-blend-mode: screen;
+}
+.dvd-glitch-fx::before {
+  top: 26%;
+  background: linear-gradient(90deg, rgba(255, 0, 90, 0), rgba(255, 0, 90, 0.5) 45%, rgba(255, 0, 90, 0));
+}
+.dvd-glitch-fx::after {
+  top: 63%;
+  background: linear-gradient(90deg, rgba(0, 220, 255, 0), rgba(0, 220, 255, 0.5) 55%, rgba(0, 220, 255, 0));
+}
+.dvd-glitching .dvd-glitch-fx { animation: dvd-scan 0.34s steps(3, end) 1; }
+.dvd-glitching .dvd-glitch-fx::before { animation: dvd-tear-a 0.34s steps(3, end) 1; }
+.dvd-glitching .dvd-glitch-fx::after { animation: dvd-tear-b 0.34s steps(3, end) 1; }
+@keyframes dvd-scan {
+  0% { opacity: 0; transform: translateY(0); }
+  12% { opacity: 0.9; transform: translateY(-2px); }
+  40% { opacity: 0.25; }
+  62% { opacity: 0.75; transform: translateY(3px); }
+  100% { opacity: 0; transform: translateY(0); }
+}
+@keyframes dvd-tear-a {
+  0% { opacity: 0; transform: translateX(0); }
+  20% { opacity: 0.85; transform: translateX(-7%); }
+  50% { opacity: 0.2; transform: translateX(5%); }
+  78% { opacity: 0.6; transform: translateX(-3%); }
+  100% { opacity: 0; transform: translateX(0); }
+}
+@keyframes dvd-tear-b {
+  0% { opacity: 0; transform: translateX(0); }
+  22% { opacity: 0.7; transform: translateX(6%); }
+  52% { opacity: 0.25; transform: translateX(-5%); }
+  82% { opacity: 0.6; transform: translateX(2%); }
+  100% { opacity: 0; transform: translateX(0); }
+}
+
+/* Respect reduced-motion: keep the colour cycle, drop the jitter/scanline storm. */
+@media (prefers-reduced-motion: reduce) {
+  .dvd-glitching .dvd-logo,
+  .dvd-glitching .dvd-np,
+  .dvd-glitching .dvd-stage,
+  .dvd-glitching .dvd-glitch-fx,
+  .dvd-glitching .dvd-glitch-fx::before,
+  .dvd-glitching .dvd-glitch-fx::after {
+    animation: none;
+  }
+}

@@ -458,6 +458,15 @@ impl Catalog {
         Ok(())
     }
 
+    /// Drop every indexed row of one `kind` ("video"/"audio"/"book"/"game"). Used to force a
+    /// re-classification pass after the scanner's logic changes — the next reconcile re-adds the
+    /// rows (cheaply, for video) with the new media_type / season / series name. Returns the count.
+    pub fn clear_library_files_kind(&self, kind: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n = conn.execute("DELETE FROM library_files WHERE kind=?1", params![kind])?;
+        Ok(n)
+    }
+
     /// A cheap monotonic-ish signal that changes whenever the catalog/library content changes,
     /// so a companion iPad can ask "did anything change?" before pulling the full snapshot.
     /// Composite of MAX(meta.updated_at) (enrichment/poster edits) and MAX(items.added_at)+COUNT

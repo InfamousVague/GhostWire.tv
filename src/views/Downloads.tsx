@@ -48,6 +48,8 @@ interface DownloadsProps {
   onRemoveImport?: (id: string) => void;
   /** Re-queue a failed import. */
   onRetryImport?: (id: string) => void;
+  /** Cancel an active/queued import (kills its download process). */
+  onCancelImport?: (id: string) => void;
   /** Open the Music download folder in Finder. */
   onRevealMusicFolder?: () => void;
   /** Signals when the view is first usable for perf timing. */
@@ -97,6 +99,7 @@ export function Downloads({
   musicImports = [],
   onRemoveImport,
   onRetryImport,
+  onCancelImport,
   onRevealMusicFolder,
   onReady,
 }: DownloadsProps) {
@@ -356,6 +359,7 @@ export function Downloads({
                 job={job}
                 onRemove={onRemoveImport ? () => onRemoveImport(job.id) : undefined}
                 onRetry={onRetryImport ? () => onRetryImport(job.id) : undefined}
+                onCancel={onCancelImport ? () => onCancelImport(job.id) : undefined}
               />
             ))}
           </Card>
@@ -717,10 +721,12 @@ function MusicImportRow({
   job,
   onRemove,
   onRetry,
+  onCancel,
 }: {
   job: MusicImportJob;
   onRemove?: () => void;
   onRetry?: () => void;
+  onCancel?: () => void;
 }) {
   const total = job.total ?? 0;
   const pct = total > 0 ? Math.min(100, Math.round((job.completed / total) * 100)) : 0;
@@ -761,6 +767,9 @@ function MusicImportRow({
         {job.state === "error" && onRetry && (
           <Button variant="secondary" shape="pill" icon={rotateCw} onClick={onRetry}>Retry</Button>
         )}
+        {onCancel && job.state === "downloading" && (
+          <Button variant="secondary" intent="error" appearance="subtle" shape="pill" icon={x} onClick={onCancel}>Cancel</Button>
+        )}
         {onRemove && job.state !== "downloading" && (
           <Button variant="ghost" iconOnly icon={x} aria-label="Remove import" onClick={onRemove} />
         )}
@@ -790,7 +799,14 @@ function DownloadRowImpl({
   onPause: () => void;
   onReveal: () => void;
 }) {
-  const pct = Math.round(d.progress * 100);
+  const ratio = Math.max(0, Math.min(1, d.progress));
+  const pct = ratio * 100;
+  // Tenths while it's small so a big download visibly ticks up instead of sitting on "0%" for the
+  // first few hundred MB; whole numbers past 10%.
+  const pctLabel = pct > 0 && pct < 9.95 ? pct.toFixed(1) : String(Math.round(pct));
+  // Keep a sliver of fill the instant anything has downloaded, so progress reads as movement.
+  const barWidth = ratio > 0 ? Math.max(pct, 2) : 0;
+  const total = d.totalBytes ?? 0;
   const heldBack = d.state === "paused" || d.state === "queued"; // shows ▶ to start/resume
   const title = displayTitle ?? d.title;
   return (
@@ -803,12 +819,18 @@ function DownloadRowImpl({
         {subtitle && <div className="dl-sub" title={subtitle}>{subtitle}</div>}
         <div className="dl-meta">
           <Chip size="sm" variant="outlined">{STATE_LABEL[d.state]}</Chip>
-          {pct < 100 && <span>{pct}%</span>}
+          {pct < 100 && <span>{pctLabel}%</span>}
+          {total > 0 && pct < 100 && <span>{formatBytes(d.downloadedBytes ?? 0)} / {formatBytes(total)}</span>}
           {d.downSpeed > 0 && <span className="pstat down"><Icon icon={arrowDown} size="xs" />{formatBytesPerSec(d.downSpeed)}</span>}
           {d.upSpeed > 0 && <span className="pstat up"><Icon icon={arrowUp} size="xs" />{formatBytesPerSec(d.upSpeed)}</span>}
           <span className="pstat"><Icon icon={users} size="xs" />{formatCount(d.peers)} peer{d.peers === 1 ? "" : "s"}</span>
         </div>
-        {pct < 100 && <div className="dl-bar"><div className="dl-bar-fill" style={{ width: `${pct}%` }} /></div>}
+        {d.state === "error" && (
+          <div className="dl-import-error" title={d.error ?? undefined}>
+            {(d.error && d.error.split("\n")[0]) || "The torrent failed — it may be dead (no seeders) or unreachable. Try a different source."}
+          </div>
+        )}
+        {pct < 100 && <div className="dl-bar"><div className="dl-bar-fill" style={{ width: `${barWidth}%` }} /></div>}
       </div>
       <div className="dl-actions">
         <Button
@@ -840,7 +862,10 @@ const DownloadRow = memo(
     a.d.id === b.d.id &&
     a.d.title === b.d.title &&
     a.d.state === b.d.state &&
+    a.d.error === b.d.error &&
     a.d.progress === b.d.progress &&
+    a.d.downloadedBytes === b.d.downloadedBytes &&
+    a.d.totalBytes === b.d.totalBytes &&
     a.d.downSpeed === b.d.downSpeed &&
     a.d.upSpeed === b.d.upSpeed &&
     a.d.peers === b.d.peers,

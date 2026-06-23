@@ -68,39 +68,21 @@ body {
   .app::after { animation: none; }
 }
 
-/* Halftone dot "splash" in the top-left corner — a white/blue gradient revealed only
-   through a fine dot grid, then faded out from the corner so the dots thin into the
-   aurora. Rides the background layer (behind content) and never intercepts input. */
+/* Halftone dot "splash" radiating from the top-left corner — a white/blue gradient dot grid whose
+   DOTS START LARGE at the corner and SHRINK toward the outer edge of the field (true halftone size
+   falloff). Drawn on a <canvas> (HalftoneCanvas) — each dot's radius is computed from its distance
+   to the corner, which renders the large→small falloff reliably across engines. (The prior CSS-mask
+   version flattened to uniform dots in WKWebView.) Rides the background layer, never takes input. */
 .app-halftone {
   position: absolute;
-  top: 0;
-  left: 0;
-  width: min(820px, 66vw);
-  height: min(740px, 70vh);
+  /* Nudged a few px up + left so the big corner dots tuck slightly into the corner. */
+  top: -8px;
+  left: -8px;
+  /* Large overall radius — the dot field spans most of the window from the top-left corner. */
+  width: min(720px, 56vw);
+  height: min(660px, 62vh);
   z-index: -1;
   pointer-events: none;
-  /* Dot colour: cool white at the corner easing into the brand blue/indigo. */
-  background: linear-gradient(
-    135deg,
-    rgba(233, 241, 255, 0.90) 0%,
-    rgba(123, 162, 255, 0.66) 44%,
-    rgba(91, 107, 214, 0.42) 100%
-  );
-  /* Layer 1 = fine dot grid, layer 2 = corner falloff. Intersect them so only the dots
-     near the top-left survive, thinning out toward the lower-right for the splash. */
-  -webkit-mask-image:
-    radial-gradient(circle at center, #000 0 1.05px, transparent 1.5px),
-    radial-gradient(150% 150% at 0% 0%, #000 12%, transparent 76%);
-  mask-image:
-    radial-gradient(circle at center, #000 0 1.05px, transparent 1.5px),
-    radial-gradient(150% 150% at 0% 0%, #000 12%, transparent 76%);
-  -webkit-mask-size: 10px 10px, 100% 100%;
-  mask-size: 10px 10px, 100% 100%;
-  -webkit-mask-position: top left, top left;
-  mask-position: top left, top left;
-  -webkit-mask-repeat: repeat, no-repeat;
-  mask-repeat: repeat, no-repeat;
-  -webkit-mask-composite: source-in;
-  mask-composite: intersect;
-  opacity: 0.27;
+  display: block;
+  opacity: 0.40;
 }

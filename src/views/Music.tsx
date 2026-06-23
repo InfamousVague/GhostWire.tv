@@ -6,6 +6,7 @@ import { Chip } from "@mattmattmattmatt/base/primitives/chip/Chip";
 import { SegmentedControl } from "@mattmattmattmatt/base/primitives/segmented-control/SegmentedControl";
 import { PosterRow } from "../components/PosterRow";
 import { PosterArt } from "../components/PosterArt";
+import { MusicDiscovery } from "../components/MusicDiscovery";
 import { relayMusicUrl } from "../lib/relay";
 import { PosterGridSkeleton } from "../components/Skeletons";
 import { useContextMenu, type MenuAction } from "../components/ContextMenu";
@@ -24,6 +25,7 @@ import {
   trashDownloaded,
   isMusicImportLink,
   type DownloadedItem,
+  type MusicSong,
   type MusicSpotiFlacInstallResult,
   type MusicSpotiFlacOutput,
   type MusicSpotiFlacStatus,
@@ -1618,6 +1620,13 @@ export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onP
     );
   }
 
+  // Queue a discovered catalog song for lossless download: hand SpotiFLAC a YouTube Music search for
+  // "<artist> <title>" (the app's keyless download path) through the existing import flow.
+  function importDiscoverySong(song: MusicSong) {
+    const q = `${song.artist} ${song.title}`.trim();
+    if (q) onImportLink?.(`https://music.youtube.com/search?q=${encodeURIComponent(q)}`);
+  }
+
   // ---- browse home (iTunes-style: featured + rows + genres) ----
   return (
     <div className="section-stack media-wide">
@@ -1665,7 +1674,7 @@ export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onP
 
       {loading ? (
         <PosterGridSkeleton square />
-      ) : artists.length === 0 ? (
+      ) : artists.length === 0 && !hasLocalQuery ? (
         <div className="empty">
           <div className="empty-inner">
             <span className="empty-glyph"><Icon icon={music} size="xl" /></span>
@@ -1771,6 +1780,8 @@ export function Music({ onPlayLocal, onPlayAudioCollection, onReplacePoster, onP
               )}
             />
           )}
+
+          <MusicDiscovery query={localQuery} onImport={importDiscoverySong} compact={localTrackResults.total > 0} />
         </div>
       ) : (
         <div className="music-browse">

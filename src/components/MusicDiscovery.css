@@ -1,0 +1,136 @@
+/* "Find new music" — keyless catalog discovery appended to the Music page search. */
+
+.mdisc {
+  margin-top: 26px;
+  padding-top: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.mdisc-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.mdisc-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 800;
+  color: color-mix(in srgb, var(--gg-seafoam) 80%, #fff);
+}
+
+.mdisc-sub {
+  font-size: 12px;
+  opacity: 0.55;
+}
+
+.mdisc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 16px;
+}
+
+.mdisc-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 0;
+}
+
+.mdisc-art {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: 13px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--gg-seafoam) 20%, transparent), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  color: color-mix(in srgb, var(--gg-seafoam) 70%, #fff);
+}
+
+.mdisc-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.mdisc-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: rgba(0, 0, 0, 0.32);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.16s;
+}
+
+.mdisc-card:hover .mdisc-play,
+.mdisc-play.on {
+  opacity: 1;
+}
+
+.mdisc-play.on {
+  background: rgba(0, 0, 0, 0.42);
+  color: var(--gg-seafoam, #5fe1e9);
+}
+
+.mdisc-info {
+  min-width: 0;
+}
+
+.mdisc-name {
+  font-size: 13px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mdisc-artist {
+  margin-top: 2px;
+  font-size: 11.5px;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mdisc-dl {
+  align-self: flex-start;
+}
+
+.mdisc-empty {
+  padding: 28px;
+  text-align: center;
+  font-size: 13px;
+  opacity: 0.6;
+  border-radius: 14px;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+}
+
+.mdisc-skel {
+  height: 0;
+}
+
+.mdisc-skel::before {
+  content: "";
+  display: block;
+  aspect-ratio: 1;
+  border-radius: 13px;
+  background: linear-gradient(100deg, rgba(255, 255, 255, 0.04) 30%, rgba(255, 255, 255, 0.09) 50%, rgba(255, 255, 255, 0.04) 70%);
+  background-size: 200% 100%;
+  animation: mdisc-shimmer 1.3s linear infinite;
+}
+
+@keyframes mdisc-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}

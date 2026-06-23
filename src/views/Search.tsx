@@ -126,9 +126,18 @@ export function Search({
   const isSpotify = isMusicImportLink(trimmed);
   function submit() {
     const v = value.trim();
-    if (isMusicImportLink(v)) onSpotify?.(v);
-    else if (MAGNET_RE.test(v)) onAddMagnet(v);
-    else if (v) onSearch(v);
+    if (isMusicImportLink(v)) {
+      // A pasted music link is handed straight to the background import queue (App shows the
+      // "importing in the background" toast). Clear the box afterwards so the consumed link
+      // doesn't linger in the field — matching the clear-button behaviour below.
+      onSpotify?.(v);
+      setValue("");
+      onSearch("");
+    } else if (MAGNET_RE.test(v)) {
+      onAddMagnet(v);
+    } else if (v) {
+      onSearch(v);
+    }
   }
 
   const actionLabel = isSpotify ? "Import" : isMagnet ? "Stream" : "Search";

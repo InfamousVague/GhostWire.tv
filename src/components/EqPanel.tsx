@@ -12,6 +12,17 @@ const LOG_MIN = Math.log10(20);
 const LOG_MAX = Math.log10(20000);
 const CURVE_PAD = 6; // px of headroom at the canvas edges (CSS px)
 
+/** Resolve a `#rgb`/`#rrggbb` palette value to an `rgba()` string at the given alpha (canvas can't
+ *  read CSS vars, so we read --gg-teal/--gg-seafoam and convert here). Falls back to the input. */
+function withAlpha(color: string, a: number): string {
+  const h = color.replace("#", "").trim();
+  const n = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const r = parseInt(n.slice(0, 2), 16);
+  const g = parseInt(n.slice(2, 4), 16);
+  const b = parseInt(n.slice(4, 6), 16);
+  return [r, g, b].some(Number.isNaN) ? color : `rgba(${r}, ${g}, ${b}, ${a})`;
+}
+
 function fmtFreq(hz: number): string {
   return hz >= 1000 ? `${hz / 1000}k` : `${hz}`;
 }
@@ -74,6 +85,12 @@ export function EqPanel({ eq, onClose }: { eq: EqApi; onClose: () => void }) {
     if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
 
+    // Pull the ghostly accent (teal → seafoam) from the live palette so the EQ matches the app —
+    // and tracks the user's chosen accent from Appearance settings.
+    const css = getComputedStyle(document.documentElement);
+    const teal = css.getPropertyValue("--gg-teal").trim() || "#2dcdd6";
+    const seafoam = css.getPropertyValue("--gg-seafoam").trim() || "#6ee7d7";
+
     const logCentres = eq.frequencies.map((f) => Math.log10(f));
     const gains = eq.enabled ? eq.bands : eq.bands.map(() => 0);
     const yFor = (db: number) => h / 2 - (db / GAIN_MAX) * (h / 2 - CURVE_PAD * dpr);
@@ -95,9 +112,9 @@ export function EqPanel({ eq, onClose }: { eq: EqApi; onClose: () => void }) {
 
     // Fill under the curve.
     const grad = ctx.createLinearGradient(0, 0, w, 0);
-    grad.addColorStop(0, "rgba(96,165,250,0.30)");
-    grad.addColorStop(0.5, "rgba(167,139,250,0.30)");
-    grad.addColorStop(1, "rgba(244,114,182,0.30)");
+    grad.addColorStop(0, withAlpha(teal, 0.34));
+    grad.addColorStop(0.5, withAlpha(seafoam, 0.30));
+    grad.addColorStop(1, withAlpha(teal, 0.34));
     ctx.beginPath();
     ctx.moveTo(0, h / 2);
     for (const [px, py] of pts) ctx.lineTo(px, py);
@@ -110,7 +127,7 @@ export function EqPanel({ eq, onClose }: { eq: EqApi; onClose: () => void }) {
     ctx.beginPath();
     pts.forEach(([px, py], i) => (i ? ctx.lineTo(px, py) : ctx.moveTo(px, py)));
     ctx.lineWidth = 2.2 * dpr;
-    ctx.strokeStyle = eq.enabled ? "rgba(190,210,255,0.95)" : "rgba(255,255,255,0.35)";
+    ctx.strokeStyle = eq.enabled ? withAlpha(seafoam, 0.95) : "rgba(255,255,255,0.35)";
     ctx.stroke();
 
     // Draggable handles at each band centre.
@@ -123,7 +140,7 @@ export function EqPanel({ eq, onClose }: { eq: EqApi; onClose: () => void }) {
       ctx.fill();
       if (eq.enabled) {
         ctx.lineWidth = 1.5 * dpr;
-        ctx.strokeStyle = "rgba(120,150,255,0.9)";
+        ctx.strokeStyle = withAlpha(teal, 0.9);
         ctx.stroke();
       }
     });

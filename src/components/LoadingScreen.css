@@ -72,26 +72,9 @@
   height: 240px;
   z-index: 0;
   pointer-events: none;
-  background: linear-gradient(
-    135deg,
-    rgba(233, 241, 255, 0.9) 0%,
-    rgba(123, 162, 255, 0.66) 44%,
-    rgba(91, 107, 214, 0.42) 100%
-  );
-  -webkit-mask-image:
-    radial-gradient(circle at center, #000 0 1.05px, transparent 1.5px),
-    radial-gradient(150% 150% at 0% 0%, #000 12%, transparent 76%);
-  mask-image:
-    radial-gradient(circle at center, #000 0 1.05px, transparent 1.5px),
-    radial-gradient(150% 150% at 0% 0%, #000 12%, transparent 76%);
-  -webkit-mask-size: 9px 9px, 100% 100%;
-  mask-size: 9px 9px, 100% 100%;
-  -webkit-mask-position: top left, top left;
-  mask-position: top left, top left;
-  -webkit-mask-repeat: repeat, no-repeat;
-  mask-repeat: repeat, no-repeat;
-  -webkit-mask-composite: source-in;
-  mask-composite: intersect;
+  display: block;
+  /* Dots are drawn on a <canvas> (HalftoneCanvas) — size-graded from the corner,
+     matching the app-shell halftone. */
   opacity: 0.3;
 }
 

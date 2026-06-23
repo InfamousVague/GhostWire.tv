@@ -32,8 +32,9 @@
 .eqp-inactive {
   font-size: 0.68rem;
   font-weight: 500;
-  color: #fbbf24;
-  background: rgba(251, 191, 36, 0.14);
+  color: var(--gg-text-dim);
+  background: color-mix(in srgb, var(--gg-seafoam) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--gg-seafoam) 22%, transparent);
   padding: 2px 7px;
   border-radius: 999px;
 }

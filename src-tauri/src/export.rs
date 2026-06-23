@@ -213,6 +213,170 @@ fn media_type(kind: &str, p: &Parsed) -> &'static str {
     }
 }
 
+// ---- folder-aware show / extras classification ------------------------------------------------
+// A filename alone can't tell that "The Office/Extras/Deleted Scenes.mkv" or "The Office/Season 03/
+// 05 - Dinner Party.mkv" belongs to The Office — there's no SxxExx in the name — so such files land
+// in Movies, or fragment into bogus one-off "shows" named after the clip. These helpers read the
+// enclosing folders (the organized show tree) to recover the real series name + season.
+
+/// `Season 3` / `S03` / `Series 2` folder → its number; `Specials` → 0. None for anything else.
+fn season_dir_number(name: &str) -> Option<i64> {
+    let n = name.trim();
+    if n.eq_ignore_ascii_case("specials") {
+        return Some(0);
+    }
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)^(?:season|series|s)\s*0*(\d{1,3})$").unwrap())
+        .captures(n)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+}
+
+/// Plex/Jellyfin "local extras" subfolders — a video inside one is a show special (season 0).
+fn is_extras_dir(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "extras"
+            | "featurettes"
+            | "behind the scenes"
+            | "deleted scenes"
+            | "bloopers"
+            | "interviews"
+            | "bonus"
+            | "webisodes"
+    )
+}
+
+/// Generic library container folders that never name a series themselves.
+fn is_library_container(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "tv shows"
+            | "tvshows"
+            | "tv"
+            | "shows"
+            | "series"
+            | "movies"
+            | "downloads"
+            | "download"
+            | "media"
+            | "video"
+            | "videos"
+            | "library"
+            | "complete"
+            | "completed"
+            | "new"
+    )
+}
+
+/// Tidy a folder name into a series title — drop a trailing "(2005)"/"[tag]" and dotted spacing.
+fn clean_folder_title(folder: &str) -> String {
+    let mut t = folder.replace(['.', '_'], " ");
+    for cut in [" (", " [", " {"] {
+        if let Some(p) = t.find(cut) {
+            t.truncate(p);
+        }
+    }
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// If a (space-normalized) name carries an extras marker, return the series-name HEAD before it
+/// ("The Office - Deleted Scenes" → "The Office"; bare "Bloopers" → ""). None when it isn't an extra.
+fn extras_head(norm_name: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(deleted\s+scenes?|behind[\s-]*the[\s-]*scenes?|behindthescenes|featurettes?|bloopers?|gag\s+reel|outtakes?|webisodes?|bonus\s+features?)\b",
+        )
+        .unwrap()
+    });
+    let m = re.find(norm_name)?;
+    let head = norm_name[..m.start()]
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '-' | '–' | '—' | ':' | '|' | '('))
+        .trim()
+        .to_string();
+    Some(head)
+}
+
+/// Refine a filename-parsed video using its folder tree (`ancestors` run root→file, outermost
+/// first): reclassify show episodes/extras the filename alone misses, take the series name from the
+/// show folder, and mark extras as season 0 — so they group under their parent show.
+fn apply_folder_context(p: &mut Parsed, stem: &str, ancestors: &[String]) {
+    let norm_stem = stem.replace(['.', '_'], " ");
+    let file_extra_head = extras_head(&norm_stem);
+    let file_is_extra = file_extra_head.is_some();
+
+    // Deepest Season-NN / Specials / extras folder decides season + show membership; the series is
+    // the folder directly above that marker.
+    let mut folder_season: Option<i64> = None;
+    let mut folder_extra = false;
+    let mut folder_show: Option<String> = None;
+    for i in (0..ancestors.len()).rev() {
+        let n = ancestors[i].trim();
+        let season = season_dir_number(n);
+        if season.is_some() || is_extras_dir(n) {
+            folder_season = season.or(Some(0));
+            folder_extra = season == Some(0) || (season.is_none() && is_extras_dir(n));
+            if i > 0 {
+                let above = ancestors[i - 1].trim();
+                if !above.is_empty()
+                    && !is_library_container(above)
+                    && season_dir_number(above).is_none()
+                    && !is_extras_dir(above)
+                {
+                    folder_show = Some(ancestors[i - 1].clone());
+                }
+            }
+            break;
+        }
+    }
+    let in_show_tree = folder_season.is_some();
+
+    // Nothing about the folder tree or the name says "show" — leave a genuine movie alone.
+    if !in_show_tree && !file_is_extra && !p.is_show {
+        return;
+    }
+    p.is_show = true;
+
+    // Season: an extra is season 0 (a special); otherwise honour a Season-NN folder.
+    if file_is_extra || folder_extra {
+        p.season = Some(0);
+        p.episode = None;
+    } else if let Some(s) = folder_season {
+        p.season = Some(s);
+    }
+
+    // Series name: the show folder wins inside an organized tree; for a loose extra take the head
+    // before the extras phrase, else the immediate parent folder.
+    if in_show_tree {
+        if let Some(folder) = &folder_show {
+            let name = clean_folder_title(folder);
+            if !name.is_empty() {
+                p.title = name;
+            }
+        } else if let Some(head) = file_extra_head.filter(|h| !h.is_empty()) {
+            p.title = head;
+        }
+    } else if file_is_extra {
+        if let Some(head) = file_extra_head.filter(|h| !h.is_empty()) {
+            p.title = head;
+        } else if let Some(folder) = ancestors.last() {
+            let n = folder.trim();
+            if !n.is_empty()
+                && !is_library_container(n)
+                && season_dir_number(n).is_none()
+                && !is_extras_dir(n)
+            {
+                let name = clean_folder_title(folder);
+                if !name.is_empty() {
+                    p.title = name;
+                }
+            }
+        }
+    }
+}
+
 /// Relative destination path under a library root, Plex naming convention.
 fn rel_path(p: &Parsed, kind: &str, ext: &str) -> String {
     let t = sanitize(&p.title);
@@ -305,7 +469,7 @@ fn clean_game_title(name: &str) -> String {
 /// Recursively collect exportable media files under `root` (bounded depth).
 pub fn scan(root: &Path) -> Vec<Exportable> {
     let mut out = Vec::new();
-    walk(root, 0, &mut out);
+    walk(root, root, 0, &mut out);
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     out
 }
@@ -316,11 +480,23 @@ pub fn scan(root: &Path) -> Vec<Exportable> {
 // dropping rows). Still bounded so a pathological tree can't blow up memory/time.
 const MAX_SCAN_FILES: usize = 20_000;
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<Exportable>) {
+fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Exportable>) {
     if depth > 6 || out.len() > MAX_SCAN_FILES {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
+    // Folder names between the library root and this dir — the show/season/extras context a
+    // filename alone can't see (so "The Office/Extras/Deleted Scenes.mkv" groups under The Office).
+    let ancestors: Vec<String> = dir
+        .strip_prefix(root)
+        .ok()
+        .map(|rel| {
+            rel.components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     for entry in entries.flatten() {
         let path = entry.path();
         // Skip macOS dotfiles — especially AppleDouble `._*` resource forks, which carry
@@ -366,7 +542,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Exportable>) {
                     continue;
                 }
             }
-            walk(&path, depth + 1, out);
+            walk(root, &path, depth + 1, out);
             continue;
         }
         let ext = ext_of(&path);
@@ -384,7 +560,12 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Exportable>) {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let parsed = parse_name(stem);
+        let mut parsed = parse_name(stem);
+        // Show extras / season-folder files have no SxxExx in the name; recover the series from the
+        // enclosing folders so they group under their show instead of becoming movies / new shows.
+        if kind == "video" {
+            apply_folder_context(&mut parsed, stem, &ancestors);
+        }
         out.push(Exportable {
             file_name: path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
             size_bytes: size,
@@ -587,5 +768,73 @@ pub async fn plex_scan(client: &reqwest::Client, server: &str, token: &str) -> R
 /// The staging dir for transcodes, under the app data dir.
 pub fn staging_dir(data_dir: &str) -> PathBuf {
     PathBuf::from(data_dir).join("export-staging")
+}
+
+#[cfg(test)]
+mod folder_classify_tests {
+    use super::*;
+
+    /// Classify exactly as the scan does for a video file: filename parse + folder-context refine.
+    fn classify(stem: &str, ancestors: &[&str]) -> Parsed {
+        let anc: Vec<String> = ancestors.iter().map(|s| s.to_string()).collect();
+        let mut p = parse_name(stem);
+        apply_folder_context(&mut p, stem, &anc);
+        p
+    }
+
+    #[test]
+    fn extras_folder_groups_under_show() {
+        let p = classify("Deleted Scenes", &["The Office", "Extras"]);
+        assert!(p.is_show);
+        assert_eq!(p.title, "The Office");
+        assert_eq!(p.season, Some(0));
+        assert_eq!(media_type("video", &p), "show");
+    }
+
+    #[test]
+    fn season_folder_without_marker_is_show() {
+        let p = classify("05 - Dinner Party", &["The Office", "Season 03"]);
+        assert!(p.is_show);
+        assert_eq!(p.title, "The Office");
+        assert_eq!(p.season, Some(3));
+    }
+
+    #[test]
+    fn specials_folder_is_season_zero() {
+        let p = classify("Christmas Special", &["The Office", "Specials"]);
+        assert!(p.is_show);
+        assert_eq!(p.title, "The Office");
+        assert_eq!(p.season, Some(0));
+    }
+
+    #[test]
+    fn loose_extra_uses_filename_head() {
+        let p = classify("The Office - Bloopers", &[]);
+        assert!(p.is_show);
+        assert_eq!(p.title, "The Office");
+        assert_eq!(p.season, Some(0));
+    }
+
+    #[test]
+    fn real_episode_in_nested_show_tree_keeps_numbers_and_series() {
+        let p = classify("The Office - S03E05", &["TV Shows", "The Office", "Season 03"]);
+        assert!(p.is_show);
+        assert_eq!(p.title, "The Office"); // the container "TV Shows" must NOT win
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(5));
+    }
+
+    #[test]
+    fn genuine_movie_in_movie_folder_stays_movie() {
+        let p = classify("The Matrix 1999 1080p", &["Movies", "The Matrix (1999)"]);
+        assert!(!p.is_show);
+        assert_eq!(media_type("video", &p), "movie");
+    }
+
+    #[test]
+    fn plain_movie_with_year_folder_not_reclassified() {
+        let p = classify("Inception 2010", &["Inception (2010)"]);
+        assert!(!p.is_show);
+    }
 }
 

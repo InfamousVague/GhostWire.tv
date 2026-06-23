@@ -208,6 +208,87 @@ pub async fn album_tracks(client: &reqwest::Client, album_id: i64) -> Result<Vec
     Ok(tracks)
 }
 
+// ---- flat song search (the Music page "find new music" feed) ----
+
+#[derive(Deserialize)]
+struct SongRaw {
+    #[serde(rename = "wrapperType")]
+    wrapper_type: Option<String>,
+    #[serde(rename = "trackId")]
+    track_id: Option<i64>,
+    #[serde(rename = "trackName")]
+    track_name: Option<String>,
+    #[serde(rename = "artistName")]
+    artist_name: Option<String>,
+    #[serde(rename = "collectionName")]
+    collection_name: Option<String>,
+    #[serde(rename = "artworkUrl100")]
+    artwork: Option<String>,
+    #[serde(rename = "previewUrl")]
+    preview_url: Option<String>,
+    #[serde(rename = "trackViewUrl")]
+    track_view_url: Option<String>,
+    #[serde(rename = "releaseDate")]
+    release_date: Option<String>,
+    #[serde(rename = "trackTimeMillis")]
+    track_time: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Song {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub artwork: Option<String>,
+    pub preview_url: Option<String>,
+    pub apple_url: Option<String>,
+    pub year: Option<i64>,
+    pub duration_ms: i64,
+}
+
+/// Flat song search across the keyless iTunes catalog — powers the Music page's "find new music".
+pub async fn search_songs(client: &reqwest::Client, query: &str) -> Result<Vec<Song>> {
+    let resp: LookupResp<SongRaw> = client
+        .get("https://itunes.apple.com/search")
+        .query(&[
+            ("term", query),
+            ("entity", "song"),
+            ("limit", "18"),
+            ("country", "US"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut seen: HashSet<i64> = HashSet::new();
+    let songs = resp
+        .results
+        .into_iter()
+        .filter(|r| r.wrapper_type.as_deref().map(|w| w == "track").unwrap_or(true))
+        .filter_map(|r| {
+            let id = r.track_id?;
+            if !seen.insert(id) {
+                return None;
+            }
+            Some(Song {
+                id,
+                title: r.track_name.filter(|s| !s.is_empty())?,
+                artist: r.artist_name.unwrap_or_default(),
+                album: r.collection_name.filter(|s| !s.is_empty()),
+                artwork: r.artwork.filter(|a| !a.is_empty()).map(|a| hi_res(&a)),
+                preview_url: r.preview_url.filter(|s| !s.is_empty()),
+                apple_url: r.track_view_url.filter(|s| !s.is_empty()),
+                year: r.release_date.as_deref().and_then(|d| d.get(0..4)).and_then(|y| y.parse().ok()),
+                duration_ms: r.track_time.unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(songs)
+}
+
 /// Normalized album name for de-duplication: lowercase, parentheticals stripped.
 fn dedup_key(name: &str) -> String {
     let no_paren = regex::Regex::new(r"\s*[\(\[][^\)\]]*[\)\]]")
